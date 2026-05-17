@@ -1,0 +1,4 @@
+vfio_pci 16384 0 - Live 0xffffffffc0000000
+vfio_iommu_type1 45056 1 vfio_pci, Live 0xffffffffc0004000
+kvm_intel 372736 0 - Live 0xffffffffc0010000
+nvidia 56877056 3 - Live 0xffffffffc2000000

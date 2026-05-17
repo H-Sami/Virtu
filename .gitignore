@@ -1,0 +1,12 @@
+/target/
+/.virtu/
+*.log
+*.tmp
+
+# Private planning and handoff notes
+/AGENTS.md
+/CHECKPOINT.md
+/ROADMAP.md
+/virtu_development_plan.md
+/script.sh
+/docs/

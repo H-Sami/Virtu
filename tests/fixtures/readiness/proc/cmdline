@@ -1,0 +1,1 @@
+BOOT_IMAGE=/vmlinuz-linux root=UUID=test rw quiet intel_iommu=on iommu=pt kvm.ignore_msrs=1

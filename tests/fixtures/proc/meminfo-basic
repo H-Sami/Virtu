@@ -1,0 +1,6 @@
+MemTotal:       32768000 kB
+MemFree:         1024000 kB
+MemAvailable:   20480000 kB
+HugePages_Total:      64
+HugePages_Free:       32
+Hugepagesize:       2048 kB

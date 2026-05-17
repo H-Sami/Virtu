@@ -1,0 +1,85 @@
+[package]
+name = "virtu"
+version = "0.1.0"
+edition = "2021"
+description = "GPU passthrough automation tool for Linux"
+authors = ["Virtu Contributors"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/H-Sami/Virtu"
+
+[[bin]]
+name = "virtu"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui        = "0.26"
+crossterm      = { version = "0.27", features = ["event-stream"] }
+
+# Async runtime
+tokio          = { version = "1", features = ["full"] }
+tokio-stream   = "0.1"
+futures        = "0.3"
+
+# Serialization
+serde          = { version = "1", features = ["derive"] }
+toml           = "0.8"
+serde_json     = "1"
+
+# XML generation
+quick-xml      = { version = "0.31", features = ["serialize", "async-tokio"] }
+
+# Error handling
+anyhow         = "1"
+thiserror      = "1"
+
+# CLI
+clap           = { version = "4", features = ["derive", "color", "env"] }
+
+# Logging / tracing
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender     = "0.2"
+
+# File I/O
+tempfile       = "3"
+
+# Process management
+which          = "6"
+
+# Unix account checks and runtime-dir discovery. Calls are cfg-gated so the
+# crate still checks on non-Linux development machines.
+libc           = "0.2"
+
+# Date/time
+chrono         = { version = "0.4", features = ["serde"] }
+
+# Hashing (for snapshot manifests)
+sha2           = "0.10"
+hex            = "0.4"
+
+# Regex (error pattern matching in diagnostics)
+regex          = "1"
+
+# UUID for snapshot IDs
+uuid           = { version = "1", features = ["v4"] }
+
+# Terminal input for privilege escalation prompts
+rpassword      = "7"
+
+[dev-dependencies]
+mockall        = "0.12"
+tempfile       = "3"
+assert_fs      = "1"
+predicates     = "3"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+opt-level     = 0
+debug         = true

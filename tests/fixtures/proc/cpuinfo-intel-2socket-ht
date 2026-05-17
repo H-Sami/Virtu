@@ -1,0 +1,56 @@
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 0
+core id		: 0
+flags		: fpu vmx de pse
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 0
+core id		: 1
+flags		: fpu vmx de pse
+
+processor	: 2
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 1
+core id		: 0
+flags		: fpu vmx de pse
+
+processor	: 3
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 1
+core id		: 1
+flags		: fpu vmx de pse
+
+processor	: 4
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 0
+core id		: 0
+flags		: fpu vmx de pse
+
+processor	: 5
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 0
+core id		: 1
+flags		: fpu vmx de pse
+
+processor	: 6
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 1
+core id		: 0
+flags		: fpu vmx de pse
+
+processor	: 7
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Test CPU
+physical id	: 1
+core id		: 1
+flags		: fpu vmx de pse
+

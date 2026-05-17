@@ -1,0 +1,3 @@
+vfio_iommu_type1 45056 0 - Live 0xffffffffc0004000
+vfio_pci 16384 0 - Live 0xffffffffc0000000
+kvm_amd 167936 0 - Live 0xffffffffc0010000
