@@ -2,7 +2,9 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, and the post-reboot `virtu resume` path are all in place. The libvirt domain XML refactor and registration step (the rest of Milestone 7) is in progress. Looking Glass and single-GPU hooks are scoped for the next milestones and are not implemented yet.
+This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, and the post-reboot `virtu resume` path are all in place. The libvirt domain XML refactor and registration step (the rest of Milestone 7) is in progress, then single-GPU passthrough hooks (Milestone 9) and the diagnostics/packaging polish (Milestone 10) round out the v1.0 target.
+
+Looking Glass is explicitly out of scope for v1.0. The data model and validation still understand `LookingGlassChoice` for forward compatibility, but no installer or auto-build path will ship. Users who want Looking Glass can install the client manually after Virtu finishes.
 
 ## Current Commands
 
@@ -42,5 +44,7 @@ The first production-quality slice should support:
 
 - Arch, Fedora, Debian/Ubuntu, and openSUSE families.
 - GRUB2 and systemd-boot first, then rEFInd, Syslinux/Extlinux, and EFISTUB.
-- Dual GPU and iGPU-host setups before single-GPU hooks.
-- User-selected VM OS, ISO, RAM, CPU count, storage, monitor plan, Looking Glass preference, and keyboard/mouse passthrough.
+- Dual GPU and iGPU-host setups before single-GPU hooks; single-GPU hooks land in Milestone 9 once rollback and dual-GPU automation are proven.
+- User-selected VM OS, ISO, RAM, CPU count, storage, monitor plan, and keyboard/mouse passthrough.
+
+Looking Glass is excluded from v1.0; users who want it integrate it manually after Virtu defines the VM.
