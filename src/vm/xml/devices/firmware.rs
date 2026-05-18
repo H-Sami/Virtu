@@ -1,11 +1,11 @@
 use crate::detect::SystemProfile;
 use crate::kb::KnowledgeBase;
-use crate::vm::profile::VmProfile;
+use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
 pub fn render(
-    profile: &VmProfile,
+    view: &VmView<'_>,
     system: &SystemProfile,
     kb: &KnowledgeBase,
 ) -> Result<String, XmlError> {
@@ -30,13 +30,13 @@ pub fn render(
     )?;
     writeln!(xml, "    <nvram>{ovmf_vars}</nvram>")?;
 
-    if profile.enable_secure_boot {
+    if view.enable_secure_boot {
         writeln!(xml, "    <smmbios mode='host'/>")?;
     }
 
     writeln!(xml, "    <bootmenu enable='yes' timeout='3000'/>")?;
 
-    if profile.iso_path.is_some() {
+    if view.iso_path.is_some() {
         writeln!(xml, "    <boot dev='cdrom'/>")?;
     }
     writeln!(xml, "    <boot dev='hd'/>")?;

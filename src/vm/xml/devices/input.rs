@@ -1,8 +1,8 @@
-use crate::vm::profile::VmProfile;
+use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
-pub fn render(profile: &VmProfile) -> Result<String, XmlError> {
+pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
     let mut xml = String::new();
 
     writeln!(
@@ -10,27 +10,29 @@ pub fn render(profile: &VmProfile) -> Result<String, XmlError> {
         "    <controller type='usb' model='qemu-xhci' ports='15'/>"
     )?;
 
-    if let Some(kbd) = &profile.evdev_keyboard {
-        if let Some(path) = &kbd.evdev_path {
-            writeln!(xml, "    <input type='evdev'>")?;
-            writeln!(
-                xml,
-                "      <source dev='{}' grab='all' grabToggle='ctrl-ctrl' repeat='on'/>",
-                path.display()
-            )?;
-            writeln!(xml, "    </input>")?;
-        }
+    if let Some(path) = view.input.keyboard_evdev {
+        writeln!(xml, "    <input type='evdev'>")?;
+        writeln!(
+            xml,
+            "      <source dev='{}' grab='all' grabToggle='ctrl-ctrl' repeat='on'/>",
+            path.display()
+        )?;
+        writeln!(xml, "    </input>")?;
     }
 
-    if let Some(mouse) = &profile.evdev_mouse {
-        if let Some(path) = &mouse.evdev_path {
-            writeln!(xml, "    <input type='evdev'>")?;
-            writeln!(xml, "      <source dev='{}'/>", path.display())?;
-            writeln!(xml, "    </input>")?;
-        }
+    if let Some(path) = view.input.mouse_evdev {
+        writeln!(xml, "    <input type='evdev'>")?;
+        writeln!(xml, "      <source dev='{}'/>", path.display())?;
+        writeln!(xml, "    </input>")?;
     }
 
-    if profile.evdev_keyboard.is_none() {
+    for path in &view.input.additional_evdev {
+        writeln!(xml, "    <input type='evdev'>")?;
+        writeln!(xml, "      <source dev='{}'/>", path.display())?;
+        writeln!(xml, "    </input>")?;
+    }
+
+    if view.input.keyboard_evdev.is_none() {
         writeln!(xml, "    <input type='tablet' bus='usb'/>")?;
     }
 

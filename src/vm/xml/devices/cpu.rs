@@ -1,32 +1,28 @@
 use crate::detect::gpu::GpuVendor;
 use crate::detect::SystemProfile;
 use crate::vm::cpu_topology::calculate_pinning;
-use crate::vm::profile::VmProfile;
+use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
-pub fn render(profile: &VmProfile, system: &SystemProfile) -> Result<String, XmlError> {
+pub fn render(view: &VmView<'_>, system: &SystemProfile) -> Result<String, XmlError> {
     let mut xml = String::new();
 
-    write_cpu(&mut xml, profile, system)?;
-    write_clock(&mut xml, profile)?;
-    write_cpu_tune(&mut xml, profile, system)?;
+    write_cpu(&mut xml, view, system)?;
+    write_clock(&mut xml, view)?;
+    write_cpu_tune(&mut xml, view, system)?;
 
     Ok(xml)
 }
 
-fn write_cpu(
-    xml: &mut String,
-    profile: &VmProfile,
-    system: &SystemProfile,
-) -> Result<(), XmlError> {
+fn write_cpu(xml: &mut String, view: &VmView<'_>, system: &SystemProfile) -> Result<(), XmlError> {
     writeln!(
         xml,
         "  <cpu mode='host-passthrough' check='none' migratable='off'>"
     )?;
 
     let threads_per_core = if system.cpu.has_hyperthreading { 2 } else { 1 };
-    let vcpu_count = profile.vcpu_count;
+    let vcpu_count = view.vcpu_count;
     let sockets = 1u32;
     let cores = (vcpu_count / threads_per_core).max(1);
     let threads = threads_per_core;
@@ -41,7 +37,7 @@ fn write_cpu(
         writeln!(xml, "    <feature policy='require' name='topoext'/>")?;
     }
 
-    if profile.passthrough_gpu.vendor == GpuVendor::Nvidia && profile.enable_hyperv {
+    if view.passthrough_gpu.vendor == GpuVendor::Nvidia && view.enable_hyperv {
         writeln!(xml, "    <vendor_id state='on' value='AuthenticAMD'/>")?;
     }
 
@@ -51,8 +47,8 @@ fn write_cpu(
     Ok(())
 }
 
-fn write_clock(xml: &mut String, profile: &VmProfile) -> Result<(), XmlError> {
-    let offset = if profile.guest_os.benefits_from_hyperv() {
+fn write_clock(xml: &mut String, view: &VmView<'_>) -> Result<(), XmlError> {
+    let offset = if view.guest_os.benefits_from_hyperv() {
         "localtime"
     } else {
         "utc"
@@ -63,7 +59,7 @@ fn write_clock(xml: &mut String, profile: &VmProfile) -> Result<(), XmlError> {
     writeln!(xml, "    <timer name='pit' tickpolicy='delay'/>")?;
     writeln!(xml, "    <timer name='hpet' present='no'/>")?;
 
-    if profile.enable_hyperv {
+    if view.enable_hyperv {
         writeln!(xml, "    <timer name='hypervclock' present='yes'/>")?;
     }
 
@@ -73,14 +69,14 @@ fn write_clock(xml: &mut String, profile: &VmProfile) -> Result<(), XmlError> {
 
 fn write_cpu_tune(
     xml: &mut String,
-    profile: &VmProfile,
+    view: &VmView<'_>,
     system: &SystemProfile,
 ) -> Result<(), XmlError> {
-    if !profile.use_cpu_pinning {
+    if !view.use_cpu_pinning {
         return Ok(());
     }
 
-    let pinning = calculate_pinning(&system.cpu, profile.vcpu_count);
+    let pinning = calculate_pinning(&system.cpu, view.vcpu_count);
 
     writeln!(xml, "  <cputune>")?;
 
@@ -94,7 +90,7 @@ fn write_cpu_tune(
         pinning.emulator_cpuset
     )?;
 
-    if profile.use_iothreads {
+    if view.use_iothreads {
         writeln!(
             xml,
             "    <iothreadpin iothread='1' cpuset='{}'/>",
@@ -104,7 +100,7 @@ fn write_cpu_tune(
 
     writeln!(xml, "  </cputune>")?;
 
-    if profile.use_iothreads {
+    if view.use_iothreads {
         writeln!(xml, "  <iothreads>1</iothreads>")?;
     }
 

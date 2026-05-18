@@ -282,8 +282,11 @@ async fn looking_glass_step_is_inserted_when_enabled() {
     let plan = plan(&profile, &report, &config).unwrap();
     let lg = find_step(&plan, StepKind::LookingGlassInstall);
     assert!(!lg.must_confirm());
+    assert_eq!(lg.risk, StepRisk::ReadOnly);
+    assert!(lg.touches.is_empty());
 
-    // Manual mode does not require confirmation; AutoBuild does.
+    // Looking Glass is cut from v1.0, so AutoBuild is preserved as a
+    // read-only deferred request instead of a mutating installer plan.
     let mut config_auto = config.clone();
     config_auto.looking_glass = LookingGlassChoice::Enabled {
         install_mode: LookingGlassInstallMode::AutoBuild,
@@ -291,7 +294,9 @@ async fn looking_glass_step_is_inserted_when_enabled() {
     };
     let plan_auto = plan_auto_replan(&profile, &report, &config_auto);
     let lg_auto = find_step(&plan_auto, StepKind::LookingGlassInstall);
-    assert!(lg_auto.must_confirm());
+    assert!(!lg_auto.must_confirm());
+    assert_eq!(lg_auto.risk, StepRisk::ReadOnly);
+    assert!(lg_auto.touches.is_empty());
 }
 
 fn plan_auto_replan(

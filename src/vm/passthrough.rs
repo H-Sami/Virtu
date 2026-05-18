@@ -24,6 +24,12 @@ pub struct PassthroughConfig {
     /// libvirt domains and must match libvirt's accepted character set.
     pub vm_name: String,
 
+    /// Guest operating system target. The current default is Windows 11
+    /// because Virtu v1 is optimized for Windows gaming/workstation guests,
+    /// but later wizard/CLI work can expose this directly to the user.
+    #[serde(default = "default_guest_os")]
+    pub guest_os: GuestOs,
+
     /// Overall passthrough strategy. The `gpu_roles` list must be consistent
     /// with this mode. See [`PassthroughConfig::derived_mode`] for the
     /// implied mode based on `gpu_roles` alone.
@@ -54,6 +60,47 @@ pub struct PassthroughConfig {
 
     /// Evdev keyboard/mouse passthrough selections.
     pub input: InputChoice,
+}
+
+/// Guest OS target for generated libvirt XML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GuestOs {
+    Windows7,
+    Windows10,
+    Windows11,
+    Linux,
+    Other,
+}
+
+impl GuestOs {
+    pub fn requires_tpm(self) -> bool {
+        matches!(self, GuestOs::Windows11)
+    }
+
+    pub fn benefits_from_hyperv(self) -> bool {
+        matches!(
+            self,
+            GuestOs::Windows7 | GuestOs::Windows10 | GuestOs::Windows11
+        )
+    }
+
+    pub fn enables_secure_boot_by_default(self) -> bool {
+        matches!(self, GuestOs::Windows11)
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            GuestOs::Windows7 => "Windows 7",
+            GuestOs::Windows10 => "Windows 10",
+            GuestOs::Windows11 => "Windows 11",
+            GuestOs::Linux => "Linux",
+            GuestOs::Other => "Other",
+        }
+    }
+}
+
+fn default_guest_os() -> GuestOs {
+    GuestOs::Windows11
 }
 
 /// Overall GPU passthrough strategy.
@@ -291,6 +338,7 @@ impl PassthroughConfig {
 
         Some(PassthroughConfig {
             vm_name: default_vm_name(profile),
+            guest_os: GuestOs::Windows11,
             gpu_mode,
             gpu_roles,
             monitor_plan,

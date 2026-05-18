@@ -274,6 +274,7 @@ mod tests {
         let plan = dummy_plan();
         let config = crate::vm::PassthroughConfig {
             vm_name: "virtu-windows".to_string(),
+            guest_os: crate::vm::GuestOs::Windows11,
             gpu_mode: crate::vm::GpuPassthroughMode::DualGpu,
             gpu_roles: Vec::new(),
             monitor_plan: crate::vm::MonitorPlan::TwoMonitors {

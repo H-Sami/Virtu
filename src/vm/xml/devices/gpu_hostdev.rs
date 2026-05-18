@@ -1,10 +1,10 @@
-use crate::vm::profile::VmProfile;
+use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
-pub fn render(profile: &VmProfile) -> Result<String, XmlError> {
+pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
     let mut xml = String::new();
-    let gpu = &profile.passthrough_gpu;
+    let gpu = view.passthrough_gpu;
     let (domain, bus, slot, function) = parse_pci_slot(&gpu.pci_slot).unwrap_or((0, 1, 0, 0));
 
     writeln!(xml, "    <!-- GPU: {} -->", gpu.model_name)?;

@@ -1,16 +1,16 @@
 use crate::detect::gpu::GpuVendor;
-use crate::vm::profile::VmProfile;
+use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
-pub fn render(profile: &VmProfile) -> Result<String, XmlError> {
+pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
     let mut xml = String::new();
 
     writeln!(xml, "  <features>")?;
     writeln!(xml, "    <acpi/>")?;
     writeln!(xml, "    <apic/>")?;
 
-    if profile.enable_hyperv {
+    if view.enable_hyperv {
         writeln!(xml, "    <hyperv mode='custom'>")?;
         writeln!(xml, "      <relaxed state='on'/>")?;
         writeln!(xml, "      <vapic state='on'/>")?;
@@ -27,7 +27,7 @@ pub fn render(profile: &VmProfile) -> Result<String, XmlError> {
         writeln!(xml, "    <ioapic driver='kvm'/>")?;
     }
 
-    if profile.passthrough_gpu.vendor == GpuVendor::Nvidia {
+    if view.passthrough_gpu.vendor == GpuVendor::Nvidia {
         writeln!(xml, "    <kvm>")?;
         writeln!(xml, "      <hidden state='on'/>")?;
         writeln!(xml, "    </kvm>")?;
