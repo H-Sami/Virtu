@@ -15,7 +15,7 @@ use virtu::detect::virtualization::VirtInfo;
 use virtu::detect::{
     audio, cpu, display_manager, distro, gpu, iommu, memory, monitors, storage, usb, SystemProfile,
 };
-use virtu::engine::{build_compatibility_report, execute_phase_a, plan, StepKind};
+use virtu::engine::{build_compatibility_report, execute_phase_a, plan, RegenerateMode, StepKind};
 use virtu::snapshot::{
     pending::DEFAULT_FILENAME as PENDING_FILENAME, FileSystem, MemoryFileSystem, PendingPlan,
     SnapshotManifest, MANIFEST_FILENAME,
@@ -153,8 +153,16 @@ async fn execute_phase_a_writes_grub_vfio_and_initramfs_and_pending_plan() {
 
     let (fs, snapshots_root, state_root) = seed_filesystem_for_plan(&plan);
 
-    let outcome = execute_phase_a(&plan, &profile, &config, &fs, &snapshots_root, &state_root)
-        .expect("phase A should succeed against MemoryFileSystem");
+    let outcome = execute_phase_a(
+        &plan,
+        &profile,
+        &config,
+        &fs,
+        &snapshots_root,
+        &state_root,
+        RegenerateMode::Skip,
+    )
+    .expect("phase A should succeed against MemoryFileSystem");
 
     // Snapshot id is non-empty and points to a real manifest.
     assert!(!outcome.snapshot_id.is_empty());
@@ -249,8 +257,16 @@ async fn execute_phase_a_is_idempotent_when_run_twice_against_same_fs() {
     let plan = plan(&profile, &report, &config).unwrap();
     let (fs, snapshots_root, state_root) = seed_filesystem_for_plan(&plan);
 
-    let first = execute_phase_a(&plan, &profile, &config, &fs, &snapshots_root, &state_root)
-        .expect("first phase A should succeed");
+    let first = execute_phase_a(
+        &plan,
+        &profile,
+        &config,
+        &fs,
+        &snapshots_root,
+        &state_root,
+        RegenerateMode::Skip,
+    )
+    .expect("first phase A should succeed");
 
     // Snapshot the post-Phase-A grub bytes so we can compare after second
     // run.
@@ -273,8 +289,16 @@ async fn execute_phase_a_is_idempotent_when_run_twice_against_same_fs() {
     // the first; manifest ids have millisecond precision.
     std::thread::sleep(std::time::Duration::from_millis(2));
 
-    let second = execute_phase_a(&plan, &profile, &config, &fs, &snapshots_root, &state_root)
-        .expect("second phase A should succeed");
+    let second = execute_phase_a(
+        &plan,
+        &profile,
+        &config,
+        &fs,
+        &snapshots_root,
+        &state_root,
+        RegenerateMode::Skip,
+    )
+    .expect("second phase A should succeed");
 
     // The host bytes must be unchanged after the second run.
     assert_ne!(first.snapshot_id, second.snapshot_id);

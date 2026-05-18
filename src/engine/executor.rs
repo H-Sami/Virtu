@@ -94,6 +94,26 @@ pub enum PhaseAError {
     Plan { step: StepKind, detail: String },
     #[error("pending-plan persistence failed: {0}")]
     PendingPersist(#[source] std::io::Error),
+    #[error("regenerate command for {step:?} failed: {source}")]
+    Regenerate {
+        step: StepKind,
+        #[source]
+        source: crate::config::writers::commands::CommandError,
+    },
+}
+
+/// Whether [`execute_phase_a`] should invoke the host's regenerate
+/// commands (`grub-mkconfig`, `mkinitcpio -P`, …) after writing the
+/// config files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegenerateMode {
+    /// Do not shell out. Tests use this so the in-memory filesystem stays
+    /// hermetic. Phase A still writes the files; the user must run the
+    /// regenerate commands themselves before reboot.
+    Skip,
+    /// Shell out. Failures abort Phase A and surface a `Regenerate`
+    /// error.
+    Run,
 }
 
 /// Outcome of a successful Phase-A run.
@@ -120,6 +140,7 @@ pub fn execute_phase_a(
     filesystem: &impl FileSystem,
     snapshots_root: &Path,
     state_root: &Path,
+    regenerate_mode: RegenerateMode,
 ) -> Result<PhaseAOutcome, PhaseAError> {
     // 1. Capture the snapshot baseline.
     let (snapshot_id, mut manifest) =
@@ -161,6 +182,12 @@ pub fn execute_phase_a(
             // PendingPlan and run by `virtu resume`.
             _ => continue,
         }
+    }
+
+    // 2b. Run host regenerate commands so the writes take effect on the
+    // next boot. Skipped in test mode.
+    if regenerate_mode == RegenerateMode::Run {
+        run_regenerate_commands(host, &completed)?;
     }
 
     // 3. Persist the updated manifest (it now carries post-edit hashes for
@@ -338,6 +365,70 @@ fn run_initramfs_step(
     let _ = snapshot_id;
 
     snapshot_then_write(manifest, filesystem, target, new_content.as_bytes())?;
+    Ok(())
+}
+
+/// Run the host's regenerate commands after the file writes finished.
+/// Picks the right command per detected bootloader / initramfs system.
+/// Failures are propagated as `PhaseAError::Regenerate`; the snapshot
+/// manifest is already on disk by the time we get here, so the user can
+/// always `virtu rollback --to <id>` to undo the file edits.
+fn run_regenerate_commands(
+    host: &SystemProfile,
+    completed: &[StepKind],
+) -> Result<(), PhaseAError> {
+    use crate::config::writers::commands;
+
+    if completed.contains(&StepKind::BootloaderWrite) {
+        match host.bootloader.kind {
+            BootloaderKind::Grub2 => {
+                commands::run_grub_mkconfig().map_err(|source| PhaseAError::Regenerate {
+                    step: StepKind::BootloaderWrite,
+                    source,
+                })?;
+            }
+            BootloaderKind::SystemdBoot => {
+                // bootctl update is best-effort: a missing binary or a
+                // non-zero exit (e.g. on first install) shouldn't abort
+                // Phase A. The new entries take effect at next boot
+                // regardless. Surface failures as a warning later.
+                if let Err(err) = commands::run_bootctl_update() {
+                    tracing::warn!(
+                        ?err,
+                        "bootctl update failed; continuing because new entries already on disk"
+                    );
+                }
+            }
+            // Bootloader writers for these are still scoped for later.
+            BootloaderKind::Refind | BootloaderKind::Syslinux | BootloaderKind::Efistub => {}
+            BootloaderKind::Unknown => {}
+        }
+    }
+
+    if completed.contains(&StepKind::InitramfsWrite) {
+        match host.initramfs_system {
+            InitramfsSystem::Mkinitcpio => {
+                commands::run_mkinitcpio_all().map_err(|source| PhaseAError::Regenerate {
+                    step: StepKind::InitramfsWrite,
+                    source,
+                })?;
+            }
+            InitramfsSystem::Dracut => {
+                commands::run_dracut_force_all().map_err(|source| PhaseAError::Regenerate {
+                    step: StepKind::InitramfsWrite,
+                    source,
+                })?;
+            }
+            InitramfsSystem::UpdateInitramfs => {
+                commands::run_update_initramfs_all().map_err(|source| PhaseAError::Regenerate {
+                    step: StepKind::InitramfsWrite,
+                    source,
+                })?;
+            }
+            InitramfsSystem::Unknown => {}
+        }
+    }
+
     Ok(())
 }
 

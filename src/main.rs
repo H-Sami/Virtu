@@ -93,6 +93,7 @@ async fn run_apply(phase: ApplyPhase, confirm: bool) -> Result<()> {
         &filesystem,
         &snapshots_root,
         &state_root,
+        engine::RegenerateMode::Run,
     )
     .map_err(|err| anyhow::anyhow!("Phase A failed: {err}"))?;
 

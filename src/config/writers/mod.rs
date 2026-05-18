@@ -6,6 +6,7 @@
 //! and are intentionally thin so the rewrite logic stays fully testable
 //! without touching the host.
 
+pub mod commands;
 pub mod grub;
 pub mod initramfs;
 pub mod systemd_boot;

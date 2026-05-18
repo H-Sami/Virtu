@@ -11,7 +11,7 @@ pub use compatibility::{
 };
 pub use executor::{
     execute_phase_a, execute_phase_b, execute_plan, execute_snapshot_step, PhaseAError,
-    PhaseAOutcome, PhaseBError, PhaseBOutcome,
+    PhaseAOutcome, PhaseBError, PhaseBOutcome, RegenerateMode,
 };
 pub use planner::{build_plan, plan, Plan, PlanError, PlanSummary};
 pub use resume::{verify_phase_a_landed, Divergence, HostMismatch, ResumeReadiness};
