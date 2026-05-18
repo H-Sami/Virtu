@@ -2,18 +2,20 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. The detection layer, compatibility report, user-choice model with read-only validation, dry-run planner, snapshot capture, manifest-backed atomic writes, and rollback are in place. Live bootloader/initramfs/VFIO writers, VM registration, Looking Glass setup, and single-GPU hooks are not implemented yet.
+This repository is in active development. The detection layer, compatibility report, user-choice model with read-only validation, dry-run planner, snapshot capture, manifest-backed atomic writes, rollback, and Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) are in place. The post-reboot resume path (Phase B), VM registration, Looking Glass, and single-GPU hooks are not implemented yet.
 
 ## Current Commands
 
 ```bash
 cargo check
 cargo test
-cargo run -- scan                  # Detect host and print compatibility findings
-cargo run -- plan                  # Build a dry-run plan from recommended choices
-cargo run -- status                # Show current VFIO binding and IOMMU state
-cargo run -- rollback --list       # List captured snapshots
-cargo run -- rollback --to <id>    # Restore a captured snapshot
+cargo run -- scan                          # Detect host and print compatibility findings
+cargo run -- plan                          # Build a dry-run plan from recommended choices
+cargo run -- status                        # Show current VFIO binding and IOMMU state
+cargo run -- apply --phase a               # Dry-run Phase A
+cargo run -- apply --phase a --confirm     # Execute Phase A, then reboot manually
+cargo run -- rollback --list               # List captured snapshots
+cargo run -- rollback --to <id>            # Restore a captured snapshot
 ```
 
 `scan`, `plan`, and `status` read `/proc`, `/sys`, `/etc/os-release`, systemd state, libvirt tools, and device nodes, so they are intended for Linux hosts. Tests run on any platform via fixture roots.
@@ -29,9 +31,9 @@ Virtu must never silently change a system. The implementation follows this order
 5. Verify the expected state.
 6. Diagnose or roll back on failure.
 
-The `plan` command exposes step 2 in full: every step declares its risk, privilege need, touched files, commands, verification description, rollback description, reboot requirement, and explicit-confirmation flag. Step 3 is implemented via `Snapshot::capture` (manifest-backed under `~/.virtu/snapshots/<id>/`), and step 6's rollback path is `virtu rollback --to <id>`. Steps 4-5 are tracked under Phase 6.
+The `plan` command exposes step 2 in full: every step declares its risk, privilege need, touched files, commands, verification description, rollback description, reboot requirement, and explicit-confirmation flag. Step 3 is implemented via `Snapshot::capture` (manifest-backed under `~/.virtu/snapshots/<id>/`), step 4 is implemented via `apply --phase a` (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild), and step 6's rollback path is `virtu rollback --to <id>`. Step 5 (post-reboot verification) ships next as `virtu resume`.
 
-GPU passthrough requires a host reboot to apply bootloader, initramfs, and module-load changes. Virtu handles this with a two-phase model: Phase A (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild) runs before reboot; Phase B (`virtu resume`, planned next) verifies the new boot state and finishes VM creation.
+GPU passthrough requires a host reboot to apply bootloader, initramfs, and module-load changes. Virtu handles this with a two-phase model: Phase A (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild) runs before reboot; Phase B (`virtu resume`) verifies the new boot state and finishes VM creation. Phase A is implemented and gated behind `--confirm`; Phase B is the next milestone.
 
 ## Target Scope
 

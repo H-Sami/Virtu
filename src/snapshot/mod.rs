@@ -22,9 +22,11 @@ use std::path::{Path, PathBuf};
 
 pub mod fs;
 pub mod manifest;
+pub mod pending;
 
 pub use fs::{FileSystem, MemoryFileSystem, RealFileSystem};
 pub use manifest::{HostSummary, RestoreAction, SnapshotEntry, SnapshotManifest};
+pub use pending::{HostFingerprint, PendingPlan};
 
 use crate::detect::SystemProfile;
 use crate::engine::planner::Plan;

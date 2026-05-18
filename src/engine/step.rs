@@ -111,7 +111,7 @@ impl std::fmt::Display for StepState {
 /// touched files, commands, privilege need, verification description, and
 /// rollback behavior up front. Read-only steps still declare the same fields
 /// for consistency.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedStep {
     pub kind: StepKind,
     pub title: String,

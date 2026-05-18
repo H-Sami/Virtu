@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Complete set of user choices that drive a Virtu passthrough plan.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassthroughConfig {
     /// Overall passthrough strategy. The `gpu_roles` list must be consistent
     /// with this mode. See [`PassthroughConfig::derived_mode`] for the

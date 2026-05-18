@@ -59,7 +59,7 @@ impl std::fmt::Display for PlanError {
 impl std::error::Error for PlanError {}
 
 /// An ordered, dry-run plan. Building a [`Plan`] does not mutate the host.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub steps: Vec<PlannedStep>,
     /// Validation warnings are kept alongside the plan so the executor and

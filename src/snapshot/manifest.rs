@@ -176,13 +176,14 @@ impl SnapshotManifest {
     }
 
     /// Derive a filesystem-safe snapshot id from a [`DateTime`] and the
-    /// current Virtu version. Matches CHECKPOINT slice 5.3:
+    /// current Virtu version. Sub-second precision is preserved (3 digits)
+    /// so two captures within the same second still get distinct ids.
     ///
     /// ```text
-    /// 2026-05-19T14-30-00Z-v0.1.0
+    /// 2026-05-19T14-30-00-123Z-v0.1.0
     /// ```
     pub fn generate_id(now: DateTime<Utc>) -> String {
-        let stamp = now.format("%Y-%m-%dT%H-%M-%SZ").to_string();
+        let stamp = now.format("%Y-%m-%dT%H-%M-%S-%3fZ").to_string();
         format!("{stamp}-v{ver}", ver = env!("CARGO_PKG_VERSION"))
     }
 
@@ -235,13 +236,13 @@ mod tests {
 
     #[test]
     fn generate_id_is_filesystem_safe_and_pinned_to_version() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-05-19T14:30:00Z")
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-19T14:30:00.123Z")
             .expect("fixed timestamp parses")
             .with_timezone(&Utc);
         let id = SnapshotManifest::generate_id(now);
         assert!(!id.contains(':'));
         assert!(!id.contains('+'));
-        assert!(id.starts_with("2026-05-19T14-30-00Z-v"));
+        assert!(id.starts_with("2026-05-19T14-30-00-123Z-v"));
         assert!(id.ends_with(env!("CARGO_PKG_VERSION")));
     }
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
-use virtu::cli::{Cli, Commands};
+use virtu::cli::{ApplyPhase, Cli, Commands};
 use virtu::{detect, engine, snapshot, tui};
 
 fn setup_logging() -> Result<()> {
@@ -38,6 +38,71 @@ fn dirs_home() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+async fn run_apply(phase: ApplyPhase, confirm: bool) -> Result<()> {
+    match phase {
+        ApplyPhase::A => {}
+    }
+
+    let virtu_home = dirs_home().join(".virtu");
+    let snapshots_root = virtu_home.join("snapshots");
+    let state_root = virtu_home.join("state");
+    let pending_path = state_root.join(snapshot::pending::DEFAULT_FILENAME);
+
+    if pending_path.exists() {
+        anyhow::bail!(
+            "A pending Virtu plan already exists at {}.\n\
+             Run `virtu resume` after rebooting, or `virtu rollback --to <id>` to abort it.",
+            pending_path.display()
+        );
+    }
+
+    let profile = detect::scan_system().await?;
+    let report = engine::build_compatibility_report(&profile);
+    report.print_human();
+
+    let config = virtu::vm::PassthroughConfig::recommended_defaults(&profile)
+        .context("No GPUs detected; cannot build a plan.")?;
+
+    let plan = match engine::plan(&profile, &report, &config) {
+        Ok(plan) => plan,
+        Err(err) => {
+            println!("\nPlan refused: {err}");
+            return Ok(());
+        }
+    };
+    plan.print_human();
+
+    if !confirm {
+        println!(
+            "\n--- DRY RUN ---\n\
+             Re-run with `--confirm` to actually apply Phase A.\n\
+             Phase A will: capture a snapshot, edit the bootloader, write the VFIO\n\
+             modprobe snippet, rebuild the initramfs, and persist a pending-plan\n\
+             record. The host will need a reboot before `virtu resume` can finish."
+        );
+        return Ok(());
+    }
+
+    let filesystem = snapshot::RealFileSystem::new();
+    let outcome = engine::execute_phase_a(
+        &plan,
+        &profile,
+        &config,
+        &filesystem,
+        &snapshots_root,
+        &state_root,
+    )
+    .map_err(|err| anyhow::anyhow!("Phase A failed: {err}"))?;
+
+    println!("\n=== PHASE A COMPLETE ===");
+    println!("{}", outcome.next_step_message);
+    println!(
+        "Pending plan written to: {}",
+        outcome.pending_plan_path.display()
+    );
+    Ok(())
 }
 
 fn check_not_root() -> Result<()> {
@@ -88,6 +153,9 @@ async fn main() -> Result<()> {
                 Ok(plan) => plan.print_human(),
                 Err(err) => println!("\nPlan refused: {err}"),
             }
+        }
+        Some(Commands::Apply { phase, confirm }) => {
+            run_apply(phase, confirm).await?;
         }
         Some(Commands::Rollback { list, snapshot_id }) => {
             if list {
