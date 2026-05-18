@@ -2,7 +2,7 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation, dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, and the post-reboot `virtu resume` path are all in place. VM XML generation and libvirt registration, Looking Glass, and single-GPU hooks are scoped for the next milestones and are not implemented yet.
+This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, and the post-reboot `virtu resume` path are all in place. The libvirt domain XML refactor and registration step (the rest of Milestone 7) is in progress. Looking Glass and single-GPU hooks are scoped for the next milestones and are not implemented yet.
 
 ## Current Commands
 
