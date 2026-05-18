@@ -38,6 +38,11 @@ pub enum Commands {
         confirm: bool,
     },
 
+    /// Continue an apply after the user has rebooted into the new kernel.
+    /// Reads the pending-plan record, verifies the bootloader/initramfs/VFIO
+    /// changes landed, and runs the remaining post-reboot steps.
+    Resume,
+
     /// Roll back a previous Virtu configuration
     Rollback {
         /// List available snapshots

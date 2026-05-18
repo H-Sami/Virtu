@@ -442,3 +442,422 @@ pub async fn execute_plan(plan: &[PlannedStep]) -> Result<()> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase B (Milestone 6.5)
+// ---------------------------------------------------------------------------
+
+/// Errors raised by Phase-B execution.
+#[derive(Debug, thiserror::Error)]
+pub enum PhaseBError {
+    #[error("phase B refused to run: {detail}")]
+    Refused { detail: String },
+    #[error("phase B I/O at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("step {step:?}: {detail}")]
+    Step { step: StepKind, detail: String },
+}
+
+impl PhaseBError {
+    fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// Outcome of a Phase-B run.
+#[derive(Debug, Clone)]
+pub struct PhaseBOutcome {
+    /// Snapshot id Phase A captured. Surfaced again here so the user has
+    /// the rollback escape hatch in mind even after a successful resume.
+    pub snapshot_id: String,
+    /// Step kinds Phase B executed (or acknowledged). Useful for the CLI
+    /// summary.
+    pub completed_steps: Vec<StepKind>,
+    /// Step kinds that Phase B saw in the plan but cannot run yet because
+    /// their underlying milestone has not landed. The CLI tells the user
+    /// which features are still scoped for later.
+    pub deferred_steps: Vec<StepKind>,
+    /// Whether the pending-plan record was cleared. False means the file
+    /// is still on disk for any reason (failure, user dry-run, etc.).
+    pub pending_cleared: bool,
+}
+
+/// Execute the post-reboot plan tail described by a [`PendingPlan`].
+///
+/// Phase B does *not* repeat the verifier; it expects the caller (the CLI)
+/// to have already invoked [`crate::engine::verify_phase_a_landed`] and
+/// confirmed `Ready`. This split keeps the executor focused on action and
+/// lets the verifier stay a pure function.
+///
+/// Today, the only mutating step kinds Phase B can produce are still
+/// scoped for later milestones (hooks → M9, Looking Glass → M8, VM XML +
+/// libvirt registration → M7). For each one we record a `deferred` entry
+/// and print a clear "not implemented yet" message. The read-only
+/// `StepKind::Verify` step is executed: it re-runs detection one more time
+/// and prints a final-state summary.
+///
+/// Once every step has been processed (executed, deferred, or skipped),
+/// Phase B clears `pending.toml`. The host is then back to a "no
+/// in-progress plan" state and the user is free to run `virtu apply`
+/// again later.
+pub fn execute_phase_b(
+    pending: &PendingPlan,
+    profile_after_reboot: &SystemProfile,
+    filesystem: &impl FileSystem,
+    state_root: &Path,
+) -> Result<PhaseBOutcome, PhaseBError> {
+    let mut outcome = PhaseBOutcome {
+        snapshot_id: pending.snapshot_id.clone(),
+        completed_steps: Vec::new(),
+        deferred_steps: Vec::new(),
+        pending_cleared: false,
+    };
+
+    for step in &pending.remaining_steps {
+        match step.kind {
+            // Phase A's responsibility; should never appear in
+            // pending.remaining_steps. Treat as a hard failure if it does
+            // because it suggests the planner or the pending-plan persisted
+            // the wrong slice.
+            StepKind::Snapshot
+            | StepKind::BootloaderWrite
+            | StepKind::VfioConfig
+            | StepKind::InitramfsWrite => {
+                return Err(PhaseBError::Refused {
+                    detail: format!(
+                        "Phase A step {:?} appeared in Phase B's pending list. The pending record is corrupt; \
+                         restore from snapshot {} and re-run virtu apply.",
+                        step.kind, pending.snapshot_id
+                    ),
+                });
+            }
+
+            // Future milestones own these; for now Phase B records them as
+            // deferred so the CLI can surface a clear "still on the
+            // roadmap" message.
+            StepKind::HookInstall
+            | StepKind::LookingGlassInstall
+            | StepKind::VmXmlGenerate
+            | StepKind::VmRegister => {
+                outcome.deferred_steps.push(step.kind.clone());
+            }
+
+            // The verify step re-runs detection and prints the final
+            // health summary. It is read-only.
+            StepKind::Verify => {
+                run_verify_step(profile_after_reboot, pending);
+                outcome.completed_steps.push(StepKind::Verify);
+            }
+        }
+    }
+
+    // Clear pending.toml so a subsequent `virtu apply` is allowed.
+    let pending_path = state_root.join(crate::snapshot::pending::DEFAULT_FILENAME);
+    if filesystem.exists(&pending_path) {
+        filesystem
+            .remove_file(&pending_path)
+            .map_err(|source| PhaseBError::io(&pending_path, source))?;
+        outcome.pending_cleared = true;
+    }
+
+    Ok(outcome)
+}
+
+fn run_verify_step(profile: &SystemProfile, pending: &PendingPlan) {
+    println!("\n=== PHASE B VERIFY ===");
+    println!(
+        "Snapshot id: {}  ({} entries to roll back if needed)",
+        pending.snapshot_id, pending.plan_summary.total_steps
+    );
+    println!("Kernel:      {}", profile.readiness.kernel_version);
+    println!(
+        "IOMMU:       {}",
+        if profile.iommu_active() {
+            format!("active ({} groups)", profile.iommu_groups.len())
+        } else {
+            "NOT active (Phase A's bootloader edit may not have applied)".to_string()
+        }
+    );
+    let vfio_loaded = profile
+        .readiness
+        .loaded_modules
+        .iter()
+        .any(|m| m == "vfio_pci");
+    println!(
+        "vfio_pci:    {}",
+        if vfio_loaded { "loaded" } else { "NOT loaded" }
+    );
+    for pci_id in &pending.host_fingerprint.passthrough_pci_ids {
+        let parts: Vec<&str> = pci_id.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (vendor, device) = (parts[0], parts[1]);
+        let driver = profile
+            .gpus
+            .iter()
+            .find(|g| {
+                g.vendor_id.eq_ignore_ascii_case(vendor) && g.device_id.eq_ignore_ascii_case(device)
+            })
+            .and_then(|g| g.current_driver.clone())
+            .unwrap_or_else(|| "(not detected as GPU)".to_string());
+        println!("Device {pci_id}: driver {driver}");
+    }
+    println!();
+}
+
+#[cfg(test)]
+mod phase_b_tests {
+    use super::*;
+    use crate::engine::planner::PlanSummary;
+    use crate::engine::step::{PrivilegeNeed, StepRisk, StepState};
+    use crate::snapshot::pending::HostFingerprint;
+    use crate::snapshot::MemoryFileSystem;
+
+    fn dummy_step(kind: StepKind) -> PlannedStep {
+        PlannedStep {
+            kind: kind.clone(),
+            title: format!("{kind:?}"),
+            summary: "test".to_string(),
+            risk: StepRisk::Low,
+            privilege: PrivilegeNeed::User,
+            state: StepState::Pending,
+            touches: Vec::new(),
+            commands: Vec::new(),
+            verification: "n/a".to_string(),
+            rollback: "n/a".to_string(),
+            requires_reboot: false,
+            requires_confirmation: false,
+        }
+    }
+
+    fn dummy_pending(remaining: Vec<PlannedStep>) -> PendingPlan {
+        PendingPlan {
+            virtu_version: "0.1.0".to_string(),
+            created_at: chrono::Utc::now(),
+            snapshot_id: "snap-x".to_string(),
+            host_fingerprint: HostFingerprint {
+                distro_id: "arch".to_string(),
+                kernel_version: "6.10.0".to_string(),
+                bootloader: crate::detect::bootloader::BootloaderKind::Grub2,
+                initramfs: crate::detect::initramfs::InitramfsSystem::Mkinitcpio,
+                passthrough_pci_ids: vec!["1002:7590".to_string()],
+                kernel_cmdline_pre_apply: "BOOT_IMAGE=/vmlinuz".to_string(),
+            },
+            plan_summary: PlanSummary {
+                total_steps: remaining.len(),
+                pending_steps: remaining.len(),
+                already_satisfied_steps: 0,
+                max_risk: StepRisk::Low,
+                requires_reboot: false,
+                requires_confirmation: false,
+            },
+            remaining_steps: remaining,
+            config: crate::vm::PassthroughConfig {
+                gpu_mode: crate::vm::GpuPassthroughMode::DualGpu,
+                gpu_roles: Vec::new(),
+                monitor_plan: crate::vm::MonitorPlan::TwoMonitors {
+                    host_connector: "DP-1".to_string(),
+                    vm_connector: "DP-2".to_string(),
+                },
+                looking_glass: crate::vm::LookingGlassChoice::Disabled,
+                iso_path: None,
+                resources: crate::vm::VmResources {
+                    ram_mb: 8192,
+                    vcpu_count: 4,
+                    disk: crate::vm::DiskChoice::Existing {
+                        path: PathBuf::from("/var/lib/libvirt/images/win.qcow2"),
+                    },
+                },
+                network: crate::vm::NetworkChoice::Nat,
+                audio: crate::vm::AudioChoice::None,
+                input: crate::vm::InputChoice::default(),
+            },
+        }
+    }
+
+    fn dummy_profile() -> SystemProfile {
+        // We never call detect, so build the smallest viable profile by
+        // hand. Only a few fields matter for the verify-step printer; the
+        // rest can be defaults.
+        use crate::detect::audio::AudioSystem;
+        use crate::detect::bootloader::{BootloaderInfo, BootloaderKind};
+        use crate::detect::cpu::CpuInfo;
+        use crate::detect::display_manager::DisplayManager;
+        use crate::detect::display_server::DisplayServer;
+        use crate::detect::distro::{DistroFamily, DistroInfo, PackageManager};
+        use crate::detect::initramfs::InitramfsSystem;
+        use crate::detect::memory::MemInfo;
+        use crate::detect::readiness::{
+            KernelHeadersInfo, OvmfInfo, ReadinessInfo, UserAccessInfo,
+        };
+        use crate::detect::storage::StorageInfo;
+        use crate::detect::virtualization::VirtInfo;
+        use std::collections::HashMap;
+        SystemProfile {
+            cpu: CpuInfo {
+                vendor: "AuthenticAMD".to_string(),
+                model_name: "test".to_string(),
+                physical_cores: 4,
+                logical_cores: 8,
+                numa_nodes: Vec::new(),
+                iommu_capable: true,
+                iommu_enabled: true,
+                has_hyperthreading: true,
+                core_to_threads: HashMap::new(),
+            },
+            gpus: Vec::new(),
+            iommu_groups: Vec::new(),
+            ram: MemInfo {
+                total_kb: 0,
+                available_kb: 0,
+                hugepages_total: 0,
+                hugepages_free: 0,
+                hugepage_size_kb: 2048,
+            },
+            distro: DistroInfo {
+                id: "arch".to_string(),
+                id_like: Vec::new(),
+                pretty_name: "Arch".to_string(),
+                version_id: String::new(),
+                family: DistroFamily::Arch,
+                package_manager: PackageManager::Pacman,
+            },
+            bootloader: BootloaderInfo {
+                kind: BootloaderKind::Grub2,
+                config_path: None,
+                entry_paths: Vec::new(),
+                active_entry: None,
+                update_command: None,
+                is_uefi: true,
+            },
+            initramfs_system: InitramfsSystem::Mkinitcpio,
+            display_manager: DisplayManager::Unknown,
+            display_server: DisplayServer::Unknown,
+            audio: AudioSystem::Unknown,
+            monitors: Vec::new(),
+            usb_devices: Vec::new(),
+            storage: StorageInfo {
+                default_vm_dir: PathBuf::from("/var/lib/libvirt/images"),
+                available_bytes: 0,
+            },
+            virtualization: VirtInfo {
+                qemu_version: None,
+                libvirt_version: None,
+                virsh_available: false,
+                virt_manager_available: false,
+                libvirtd_running: false,
+            },
+            readiness: ReadinessInfo {
+                kernel_version: "6.10.0".to_string(),
+                kernel_cmdline: "BOOT_IMAGE=/vmlinuz".to_string(),
+                kernel_cmdline_params: Vec::new(),
+                loaded_modules: Vec::new(),
+                kernel_headers: KernelHeadersInfo {
+                    present: false,
+                    path: None,
+                },
+                secure_boot: false,
+                ovmf: OvmfInfo {
+                    code_paths: Vec::new(),
+                    vars_paths: Vec::new(),
+                },
+                user_access: UserAccessInfo {
+                    username: None,
+                    groups: Vec::new(),
+                    in_libvirt_group: false,
+                    in_kvm_group: false,
+                },
+                libvirt_domains: Vec::new(),
+            },
+            secure_boot: false,
+            kernel_cmdline: "BOOT_IMAGE=/vmlinuz".to_string(),
+            scan_timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn phase_b_clears_pending_record_when_complete() {
+        let fs = MemoryFileSystem::new();
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        fs.create_dir_all(&state_root).unwrap();
+        let pending_path = state_root.join(crate::snapshot::pending::DEFAULT_FILENAME);
+        fs.write_atomic(&pending_path, b"placeholder").unwrap();
+
+        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
+        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root)
+            .expect("phase B should succeed on a verify-only plan");
+
+        assert!(outcome.pending_cleared);
+        assert!(outcome.completed_steps.contains(&StepKind::Verify));
+        assert!(!fs.exists(&pending_path));
+    }
+
+    #[test]
+    fn phase_b_records_unimplemented_step_kinds_as_deferred() {
+        let fs = MemoryFileSystem::new();
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        fs.create_dir_all(&state_root).unwrap();
+        let pending_path = state_root.join(crate::snapshot::pending::DEFAULT_FILENAME);
+        fs.write_atomic(&pending_path, b"placeholder").unwrap();
+
+        let pending = dummy_pending(vec![
+            dummy_step(StepKind::HookInstall),
+            dummy_step(StepKind::LookingGlassInstall),
+            dummy_step(StepKind::VmXmlGenerate),
+            dummy_step(StepKind::VmRegister),
+            dummy_step(StepKind::Verify),
+        ]);
+        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap();
+
+        for kind in [
+            StepKind::HookInstall,
+            StepKind::LookingGlassInstall,
+            StepKind::VmXmlGenerate,
+            StepKind::VmRegister,
+        ] {
+            assert!(outcome.deferred_steps.contains(&kind));
+        }
+        assert!(outcome.completed_steps.contains(&StepKind::Verify));
+        assert!(outcome.pending_cleared);
+    }
+
+    #[test]
+    fn phase_b_refuses_phase_a_step_in_pending_list() {
+        let fs = MemoryFileSystem::new();
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        fs.create_dir_all(&state_root).unwrap();
+
+        let pending = dummy_pending(vec![dummy_step(StepKind::BootloaderWrite)]);
+        let err = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap_err();
+        match err {
+            PhaseBError::Refused { detail } => {
+                assert!(detail.contains("BootloaderWrite"));
+                assert!(detail.contains("snap-x"));
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_b_succeeds_when_pending_record_already_absent() {
+        // If the user manually deleted pending.toml between Phase A and
+        // Phase B, the executor still walks the in-memory plan and reports
+        // pending_cleared=false instead of erroring on a missing file.
+        let fs = MemoryFileSystem::new();
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        fs.create_dir_all(&state_root).unwrap();
+
+        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
+        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap();
+        assert!(!outcome.pending_cleared);
+        assert!(outcome.completed_steps.contains(&StepKind::Verify));
+    }
+}

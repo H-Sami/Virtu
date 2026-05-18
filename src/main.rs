@@ -105,6 +105,106 @@ async fn run_apply(phase: ApplyPhase, confirm: bool) -> Result<()> {
     Ok(())
 }
 
+async fn run_resume() -> Result<()> {
+    let virtu_home = dirs_home().join(".virtu");
+    let state_root = virtu_home.join("state");
+    let pending_path = state_root.join(snapshot::pending::DEFAULT_FILENAME);
+
+    if !pending_path.exists() {
+        anyhow::bail!(
+            "No pending Virtu plan found at {}.\n\
+             `virtu resume` only runs after a successful `virtu apply --phase a --confirm`.",
+            pending_path.display()
+        );
+    }
+
+    let raw = std::fs::read_to_string(&pending_path)
+        .with_context(|| format!("reading pending-plan record at {}", pending_path.display()))?;
+    let pending: snapshot::PendingPlan = toml::from_str(&raw)
+        .with_context(|| format!("parsing pending-plan record at {}", pending_path.display()))?;
+
+    println!("=== VIRTU RESUME ===");
+    println!("Pending plan from: {}", pending.created_at.to_rfc3339());
+    println!("Snapshot id:       {}", pending.snapshot_id);
+    println!("Phase B steps:     {}", pending.remaining_steps.len());
+    println!();
+
+    let profile = detect::scan_system().await?;
+    let readiness = engine::verify_phase_a_landed(&profile, &pending);
+    match &readiness {
+        engine::ResumeReadiness::Ready => {
+            println!("Verifier: Phase A landed cleanly.\n");
+        }
+        engine::ResumeReadiness::NotReady { divergences } => {
+            println!("Verifier: Phase A did NOT land cleanly. Resume refused.\n");
+            for divergence in divergences {
+                println!("  - {}", divergence.human_summary());
+            }
+            println!(
+                "\nIf the bootloader edit failed, you can roll back with:\n  virtu rollback --to {}",
+                pending.snapshot_id
+            );
+            return Ok(());
+        }
+        engine::ResumeReadiness::WrongHost { reasons } => {
+            println!(
+                "Verifier: this host does not match the one Phase A captured. Resume refused.\n"
+            );
+            for reason in reasons {
+                println!("  - {}", reason.human_summary());
+            }
+            println!(
+                "\nIf you intended to run Phase B on a different host, abort with:\n  virtu rollback --to {}",
+                pending.snapshot_id
+            );
+            return Ok(());
+        }
+    }
+
+    let filesystem = snapshot::RealFileSystem::new();
+    let outcome = engine::execute_phase_b(&pending, &profile, &filesystem, &state_root)
+        .map_err(|err| anyhow::anyhow!("Phase B failed: {err}"))?;
+
+    println!("\n=== PHASE B SUMMARY ===");
+    if !outcome.completed_steps.is_empty() {
+        println!("Completed:");
+        for kind in &outcome.completed_steps {
+            println!("  - {kind:?}");
+        }
+    }
+    if !outcome.deferred_steps.is_empty() {
+        println!("Deferred to a later milestone (not yet implemented):");
+        for kind in &outcome.deferred_steps {
+            println!("  - {kind:?}");
+        }
+    }
+    if outcome.pending_cleared {
+        println!("\nPending-plan record cleared. You can run `virtu apply` again later.");
+    } else {
+        println!(
+            "\nPending-plan record still on disk at {}. Inspect or remove it manually if you're done.",
+            pending_path.display()
+        );
+    }
+    println!("\nSnapshot id (kept for rollback): {}", outcome.snapshot_id);
+    Ok(())
+}
+
+/// Print a one-line warning if a pending Phase-A record exists. Called
+/// from `virtu status` so the user is reminded of unfinished work.
+fn check_pending_plan_warning() {
+    let pending_path = dirs_home()
+        .join(".virtu")
+        .join("state")
+        .join(snapshot::pending::DEFAULT_FILENAME);
+    if pending_path.exists() {
+        println!(
+            "\n[NOTE] A Phase-A apply is pending. Reboot and run `virtu resume` to finish, or `virtu rollback --to <id>` to abort.\n       Record: {}",
+            pending_path.display()
+        );
+    }
+}
+
 fn check_not_root() -> Result<()> {
     #[cfg(unix)]
     {
@@ -157,6 +257,9 @@ async fn main() -> Result<()> {
         Some(Commands::Apply { phase, confirm }) => {
             run_apply(phase, confirm).await?;
         }
+        Some(Commands::Resume) => {
+            run_resume().await?;
+        }
         Some(Commands::Rollback { list, snapshot_id }) => {
             if list {
                 snapshot::list_snapshots()?;
@@ -168,6 +271,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Status) => {
+            check_pending_plan_warning();
             detect::print_vfio_status().await?;
         }
     }
