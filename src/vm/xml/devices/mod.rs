@@ -1,2 +1,9 @@
-// Device-specific XML builders will live here as the monolithic XmlBuilder
-// is split into smaller modules.
+pub mod cpu;
+pub mod disk;
+pub mod features;
+pub mod firmware;
+pub mod gpu_hostdev;
+pub mod input;
+pub mod memory;
+pub mod network;
+pub mod tpm;

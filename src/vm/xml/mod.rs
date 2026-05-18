@@ -2,9 +2,16 @@ pub mod devices;
 
 use crate::detect::SystemProfile;
 use crate::kb::KnowledgeBase;
-use crate::vm::profile::{NetworkType, VmProfile};
+use crate::vm::profile::{AudioPassthroughMethod, VmProfile};
 use anyhow::Result;
 use std::fmt::Write as FmtWrite;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum XmlError {
+    #[error("failed to write XML fragment")]
+    Format(#[from] std::fmt::Error),
+}
 
 /// Generates a complete, performance-tuned libvirt domain XML string
 /// from the VM profile and system profile.
@@ -32,13 +39,15 @@ impl<'a> XmlBuilder<'a> {
         )?;
 
         self.write_identity(&mut xml)?;
-        self.write_os(&mut xml)?;
-        self.write_features(&mut xml)?;
-        self.write_cpu(&mut xml)?;
-        self.write_clock(&mut xml)?;
-        self.write_memory(&mut xml)?;
-        self.write_cpu_tune(&mut xml)?;
-        self.write_devices(&mut xml)?;
+        xml.push_str(&devices::firmware::render(
+            self.profile,
+            self.system,
+            self.kb,
+        )?);
+        xml.push_str(&devices::features::render(self.profile)?);
+        xml.push_str(&devices::cpu::render(self.profile, self.system)?);
+        xml.push_str(&devices::memory::render(self.profile)?);
+        xml.push_str(&self.render_devices()?);
         self.write_qemu_commandline(&mut xml)?;
 
         writeln!(xml, "</domain>")?;
@@ -61,288 +70,18 @@ impl<'a> XmlBuilder<'a> {
         Ok(())
     }
 
-    fn write_os(&self, xml: &mut String) -> Result<()> {
-        writeln!(xml, "  <os firmware='efi'>")?;
-        writeln!(xml, "    <type arch='x86_64' machine='q35'>hvm</type>")?;
+    fn render_devices(&self) -> Result<String> {
+        let mut xml = String::new();
 
-        // OVMF path from KB per distro
-        let ovmf_code = self
-            .kb
-            .paths_for_distro(&self.system.distro)
-            .ovmf_code
-            .as_deref()
-            .unwrap_or("/usr/share/OVMF/OVMF_CODE.fd");
-        let ovmf_vars = self
-            .kb
-            .paths_for_distro(&self.system.distro)
-            .ovmf_vars
-            .as_deref()
-            .unwrap_or("/usr/share/OVMF/OVMF_VARS.fd");
-
-        writeln!(
-            xml,
-            "    <loader readonly='yes' type='pflash'>{ovmf_code}</loader>"
-        )?;
-        writeln!(xml, "    <nvram>{ovmf_vars}</nvram>")?;
-
-        if self.profile.enable_secure_boot {
-            writeln!(xml, "    <smmbios mode='host'/>")?;
-        }
-
-        writeln!(xml, "    <bootmenu enable='yes' timeout='3000'/>")?;
-
-        // Boot order: disk first, then CD-ROM
-        if self.profile.iso_path.is_some() {
-            writeln!(xml, "    <boot dev='cdrom'/>")?;
-        }
-        writeln!(xml, "    <boot dev='hd'/>")?;
-
-        writeln!(xml, "  </os>")?;
-        Ok(())
-    }
-
-    fn write_features(&self, xml: &mut String) -> Result<()> {
-        writeln!(xml, "  <features>")?;
-        writeln!(xml, "    <acpi/>")?;
-        writeln!(xml, "    <apic/>")?;
-
-        // Hyper-V enlightenments for Windows guests — significant performance improvement
-        if self.profile.enable_hyperv {
-            writeln!(xml, "    <hyperv mode='custom'>")?;
-            writeln!(xml, "      <relaxed state='on'/>")?;
-            writeln!(xml, "      <vapic state='on'/>")?;
-            writeln!(xml, "      <spinlocks state='on' retries='8191'/>")?;
-            writeln!(xml, "      <vpindex state='on'/>")?;
-            writeln!(xml, "      <synic state='on'/>")?;
-            writeln!(xml, "      <stimer state='on' direct='on'/>")?;
-            writeln!(xml, "      <reset state='on'/>")?;
-            writeln!(xml, "      <frequencies state='on'/>")?;
-            writeln!(xml, "      <reenlightenment state='on'/>")?;
-            writeln!(xml, "      <tlbflush state='on'/>")?;
-            writeln!(xml, "      <ipi state='on'/>")?;
-            writeln!(xml, "    </hyperv>")?;
-            writeln!(xml, "    <ioapic driver='kvm'/>")?;
-        }
-
-        // NVIDIA Error 43 fix: hide the KVM signature from the guest
-        if self.profile.passthrough_gpu.vendor == crate::detect::gpu::GpuVendor::Nvidia {
-            writeln!(xml, "    <kvm>")?;
-            writeln!(xml, "      <hidden state='on'/>")?;
-            writeln!(xml, "    </kvm>")?;
-        }
-
-        writeln!(xml, "  </features>")?;
-        Ok(())
-    }
-
-    fn write_cpu(&self, xml: &mut String) -> Result<()> {
-        writeln!(
-            xml,
-            "  <cpu mode='host-passthrough' check='none' migratable='off'>"
-        )?;
-
-        // Physical topology
-        let threads_per_core = if self.system.cpu.has_hyperthreading {
-            2
-        } else {
-            1
-        };
-        let vcpu_count = self.profile.vcpu_count;
-        let sockets = 1u32;
-        let cores = (vcpu_count / threads_per_core).max(1);
-        let threads = threads_per_core;
-
-        writeln!(
-            xml,
-            "    <topology sockets='{sockets}' dies='1' cores='{cores}' threads='{threads}'/>"
-        )?;
-
-        // Host cache passthrough — eliminates cache-related latency
-        writeln!(xml, "    <cache mode='passthrough'/>")?;
-
-        // AMD-specific: expose topology extension for correct core detection in guest
-        if self.system.cpu.vendor.contains("AMD") {
-            writeln!(xml, "    <feature policy='require' name='topoext'/>")?;
-        }
-
-        // NVIDIA vendor ID spoof to bypass VM detection in driver
-        if self.profile.passthrough_gpu.vendor == crate::detect::gpu::GpuVendor::Nvidia
-            && self.profile.enable_hyperv
-        {
-            writeln!(xml, "    <vendor_id state='on' value='AuthenticAMD'/>")?;
-        }
-
-        writeln!(xml, "  </cpu>")?;
-        writeln!(xml, "  <vcpu placement='static'>{vcpu_count}</vcpu>")?;
-
-        Ok(())
-    }
-
-    fn write_clock(&self, xml: &mut String) -> Result<()> {
-        // Windows guests: use localtime to avoid clock issues
-        let offset = if self.profile.guest_os.benefits_from_hyperv() {
-            "localtime"
-        } else {
-            "utc"
-        };
-
-        writeln!(xml, "  <clock offset='{offset}'>")?;
-        writeln!(xml, "    <timer name='rtc' tickpolicy='catchup'/>")?;
-        writeln!(xml, "    <timer name='pit' tickpolicy='delay'/>")?;
-        writeln!(xml, "    <timer name='hpet' present='no'/>")?;
-
-        if self.profile.enable_hyperv {
-            writeln!(xml, "    <timer name='hypervclock' present='yes'/>")?;
-        }
-
-        writeln!(xml, "  </clock>")?;
-        Ok(())
-    }
-
-    fn write_memory(&self, xml: &mut String) -> Result<()> {
-        let ram_kb = self.profile.ram_mb * 1024;
-        writeln!(xml, "  <memory unit='KiB'>{ram_kb}</memory>")?;
-        writeln!(xml, "  <currentMemory unit='KiB'>{ram_kb}</currentMemory>")?;
-
-        if self.profile.use_hugepages {
-            writeln!(xml, "  <memoryBacking>")?;
-            writeln!(xml, "    <hugepages/>")?;
-            writeln!(xml, "    <nosharepages/>")?;
-            writeln!(xml, "    <locked/>")?;
-            writeln!(xml, "    <source type='memfd'/>")?;
-            writeln!(xml, "    <access mode='shared'/>")?;
-            writeln!(xml, "  </memoryBacking>")?;
-        }
-
-        Ok(())
-    }
-
-    fn write_cpu_tune(&self, xml: &mut String) -> Result<()> {
-        if !self.profile.use_cpu_pinning {
-            return Ok(());
-        }
-
-        let pinning =
-            super::cpu_topology::calculate_pinning(&self.system.cpu, self.profile.vcpu_count);
-
-        writeln!(xml, "  <cputune>")?;
-
-        for (vcpu, cpuset) in &pinning.vcpu_pins {
-            writeln!(xml, "    <vcpupin vcpu='{vcpu}' cpuset='{cpuset}'/>")?;
-        }
-
-        writeln!(
-            xml,
-            "    <emulatorpin cpuset='{}'/>",
-            pinning.emulator_cpuset
-        )?;
-
-        if self.profile.use_iothreads {
-            writeln!(
-                xml,
-                "    <iothreadpin iothread='1' cpuset='{}'/>",
-                pinning.emulator_cpuset
-            )?;
-        }
-
-        writeln!(xml, "  </cputune>")?;
-
-        if self.profile.use_iothreads {
-            writeln!(xml, "  <iothreads>1</iothreads>")?;
-        }
-
-        Ok(())
-    }
-
-    fn write_devices(&self, xml: &mut String) -> Result<()> {
         writeln!(xml, "  <devices>")?;
         writeln!(xml, "    <emulator>/usr/bin/qemu-system-x86_64</emulator>")?;
+        xml.push_str(&devices::disk::render(self.profile)?);
+        xml.push_str(&devices::network::render(self.profile)?);
+        xml.push_str(&devices::gpu_hostdev::render(self.profile)?);
+        xml.push_str(&devices::input::render(self.profile)?);
+        self.write_audio(&mut xml)?;
+        xml.push_str(&devices::tpm::render(self.profile)?);
 
-        // Main disk
-        self.write_disk(xml)?;
-
-        // ISO if present
-        if let Some(iso) = &self.profile.iso_path {
-            writeln!(xml, "    <disk type='file' device='cdrom'>")?;
-            writeln!(xml, "      <driver name='qemu' type='raw'/>")?;
-            writeln!(xml, "      <source file='{}'/>", iso.display())?;
-            writeln!(xml, "      <target dev='sdb' bus='scsi'/>")?;
-            writeln!(xml, "      <readonly/>")?;
-            writeln!(xml, "    </disk>")?;
-        }
-
-        // SCSI controller for virtio-scsi
-        writeln!(
-            xml,
-            "    <controller type='scsi' index='0' model='virtio-scsi'>"
-        )?;
-        if self.profile.use_iothreads {
-            writeln!(xml, "      <driver iothread='1'/>")?;
-        }
-        writeln!(xml, "    </controller>")?;
-
-        // Network
-        self.write_network(xml)?;
-
-        // GPU passthrough
-        self.write_gpu_hostdev(xml)?;
-
-        // USB controllers
-        writeln!(
-            xml,
-            "    <controller type='usb' model='qemu-xhci' ports='15'/>"
-        )?;
-
-        // Evdev keyboard passthrough
-        if let Some(kbd) = &self.profile.evdev_keyboard {
-            if let Some(path) = &kbd.evdev_path {
-                writeln!(xml, "    <input type='evdev'>")?;
-                writeln!(
-                    xml,
-                    "      <source dev='{}' grab='all' grabToggle='ctrl-ctrl' repeat='on'/>",
-                    path.display()
-                )?;
-                writeln!(xml, "    </input>")?;
-            }
-        }
-
-        // Evdev mouse passthrough
-        if let Some(mouse) = &self.profile.evdev_mouse {
-            if let Some(path) = &mouse.evdev_path {
-                writeln!(xml, "    <input type='evdev'>")?;
-                writeln!(xml, "      <source dev='{}'/>", path.display())?;
-                writeln!(xml, "    </input>")?;
-            }
-        }
-
-        // Tablet input for cursor integration when no evdev is used
-        if self.profile.evdev_keyboard.is_none() {
-            writeln!(xml, "    <input type='tablet' bus='usb'/>")?;
-        }
-
-        // Audio
-        self.write_audio(xml)?;
-
-        // Looking Glass IVSHMEM
-        if self.profile.looking_glass.enabled {
-            writeln!(xml, "    <shmem name='looking-glass'>")?;
-            writeln!(xml, "      <model type='ivshmem-plain'/>")?;
-            writeln!(
-                xml,
-                "      <size unit='M'>{}</size>",
-                self.profile.looking_glass.buffer_size_mb
-            )?;
-            writeln!(xml, "    </shmem>")?;
-        }
-
-        // TPM for Windows 11
-        if self.profile.enable_tpm {
-            writeln!(xml, "    <tpm model='tpm-crb'>")?;
-            writeln!(xml, "      <backend type='emulator' version='2.0'/>")?;
-            writeln!(xml, "    </tpm>")?;
-        }
-
-        // Serial console (useful for debugging)
         writeln!(
             xml,
             "    <serial type='pty'><target type='isa-serial' port='0'/></serial>"
@@ -357,106 +96,10 @@ impl<'a> XmlBuilder<'a> {
         writeln!(xml, "    </graphics>")?;
 
         writeln!(xml, "  </devices>")?;
-        Ok(())
-    }
-
-    fn write_disk(&self, xml: &mut String) -> Result<()> {
-        let disk_format = if self
-            .profile
-            .disk_path
-            .extension()
-            .map(|e| e == "qcow2")
-            .unwrap_or(false)
-        {
-            "qcow2"
-        } else {
-            "raw"
-        };
-
-        writeln!(xml, "    <disk type='file' device='disk'>")?;
-        writeln!(xml, "      <driver name='qemu' type='{disk_format}' cache='none' io='native' discard='unmap'{}/>",
-            if self.profile.use_iothreads { " iothread='1'" } else { "" })?;
-        writeln!(
-            xml,
-            "      <source file='{}'/>",
-            self.profile.disk_path.display()
-        )?;
-        writeln!(xml, "      <target dev='sda' bus='scsi'/>")?;
-        writeln!(xml, "      <boot order='1'/>")?;
-        writeln!(xml, "    </disk>")?;
-        Ok(())
-    }
-
-    fn write_network(&self, xml: &mut String) -> Result<()> {
-        let vcpu_count = self.profile.vcpu_count;
-        // vhost queues should match vCPU count for best throughput
-        let queues = vcpu_count.min(8); // Practical maximum
-
-        match &self.profile.network_type {
-            NetworkType::Nat => {
-                writeln!(xml, "    <interface type='network'>")?;
-                writeln!(xml, "      <source network='default'/>")?;
-                writeln!(xml, "      <model type='virtio'/>")?;
-                writeln!(xml, "      <driver name='vhost' queues='{queues}'/>")?;
-                writeln!(xml, "    </interface>")?;
-            }
-            NetworkType::Bridge { interface } => {
-                writeln!(xml, "    <interface type='bridge'>")?;
-                writeln!(xml, "      <source bridge='{interface}'/>")?;
-                writeln!(xml, "      <model type='virtio'/>")?;
-                writeln!(xml, "      <driver name='vhost' queues='{queues}'/>")?;
-                writeln!(xml, "    </interface>")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn write_gpu_hostdev(&self, xml: &mut String) -> Result<()> {
-        let gpu = &self.profile.passthrough_gpu;
-
-        // Parse PCI slot "0000:01:00.0" → domain, bus, slot, function
-        let (domain, bus, slot, function) = parse_pci_slot(&gpu.pci_slot).unwrap_or((0, 1, 0, 0));
-
-        writeln!(xml, "    <!-- GPU: {} -->", gpu.model_name)?;
-        writeln!(
-            xml,
-            "    <hostdev mode='subsystem' type='pci' managed='yes'>"
-        )?;
-        writeln!(xml, "      <source>")?;
-        writeln!(xml, "        <address domain='0x{domain:04x}' bus='0x{bus:02x}' slot='0x{slot:02x}' function='0x{function:01x}'/>")?;
-        writeln!(xml, "      </source>")?;
-
-        // Add ROM if accessible
-        if gpu.rom_accessible {
-            let rom_path = format!(
-                "/var/lib/libvirt/vbios/{}.rom",
-                gpu.pci_slot.replace([':', '.'], "_")
-            );
-            writeln!(xml, "      <rom file='{rom_path}'/>")?;
-        }
-
-        writeln!(xml, "    </hostdev>")?;
-
-        // Companion audio device
-        if let Some(audio) = &gpu.companion_audio {
-            let (d, b, s, f) = parse_pci_slot(&audio.pci_slot).unwrap_or((0, 1, 0, 1));
-            writeln!(xml, "    <!-- GPU Audio companion -->")?;
-            writeln!(
-                xml,
-                "    <hostdev mode='subsystem' type='pci' managed='yes'>"
-            )?;
-            writeln!(xml, "      <source>")?;
-            writeln!(xml, "        <address domain='0x{d:04x}' bus='0x{b:02x}' slot='0x{s:02x}' function='0x{f:01x}'/>")?;
-            writeln!(xml, "      </source>")?;
-            writeln!(xml, "    </hostdev>")?;
-        }
-
-        Ok(())
+        Ok(xml)
     }
 
     fn write_audio(&self, xml: &mut String) -> Result<()> {
-        use crate::vm::profile::AudioPassthroughMethod;
-
         match &self.profile.audio_passthrough {
             AudioPassthroughMethod::HostAudio => {
                 let audio_type = self.system.audio.libvirt_audio_type();
@@ -486,7 +129,7 @@ impl<'a> XmlBuilder<'a> {
     fn write_qemu_commandline(&self, xml: &mut String) -> Result<()> {
         let gpu = &self.profile.passthrough_gpu;
 
-        // AMD reset bug mitigation — add pcie_acs_override if needed
+        // AMD reset bug mitigation.
         let has_reset_bug = self
             .kb
             .quirks_for_gpu(&gpu.vendor_id, &gpu.device_id)
@@ -507,20 +150,6 @@ impl<'a> XmlBuilder<'a> {
     }
 }
 
-/// Parse "0000:01:00.0" into (domain, bus, slot, function) as u32 values
-fn parse_pci_slot(slot: &str) -> Option<(u32, u32, u32, u32)> {
-    let parts: Vec<&str> = slot.split(':').collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let domain = u32::from_str_radix(parts[0], 16).ok()?;
-    let bus = u32::from_str_radix(parts[1], 16).ok()?;
-    let dev_fn: Vec<&str> = parts[2].split('.').collect();
-    let device = u32::from_str_radix(dev_fn.first()?, 16).ok()?;
-    let function = u32::from_str_radix(dev_fn.get(1)?, 16).ok()?;
-    Some((domain, bus, device, function))
-}
-
 #[cfg(unix)]
 fn current_uid() -> u32 {
     unsafe { libc::getuid() }
@@ -529,4 +158,191 @@ fn current_uid() -> u32 {
 #[cfg(not(unix))]
 fn current_uid() -> u32 {
     1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::XmlBuilder;
+    use crate::detect::audio::AudioSystem;
+    use crate::detect::bootloader::{BootloaderInfo, BootloaderKind};
+    use crate::detect::cpu::CpuInfo;
+    use crate::detect::display_manager::DisplayManager;
+    use crate::detect::display_server::DisplayServer;
+    use crate::detect::distro::{DistroFamily, DistroInfo, PackageManager};
+    use crate::detect::gpu::{GpuInfo, GpuType, GpuVendor};
+    use crate::detect::initramfs::InitramfsSystem;
+    use crate::detect::memory::MemInfo;
+    use crate::detect::readiness::{KernelHeadersInfo, OvmfInfo, ReadinessInfo, UserAccessInfo};
+    use crate::detect::storage::StorageInfo;
+    use crate::detect::virtualization::VirtInfo;
+    use crate::detect::SystemProfile;
+    use crate::kb::KnowledgeBase;
+    use crate::vm::profile::{
+        AudioPassthroughMethod, GuestOs, LookingGlassConfig, NetworkType, PassthroughMode,
+        VmProfile,
+    };
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn builder_does_not_emit_looking_glass_shmem_for_v1() {
+        let system = dummy_system_profile();
+        let mut profile = dummy_vm_profile();
+        profile.looking_glass = LookingGlassConfig {
+            enabled: true,
+            auto_compile: false,
+            target_width: 1920,
+            target_height: 1080,
+            buffer_size_mb: 64,
+        };
+        let kb = KnowledgeBase::default();
+        let xml = match XmlBuilder::new(&profile, &system, &kb).build() {
+            Ok(xml) => xml,
+            Err(err) => panic!("builder failed: {err}"),
+        };
+
+        assert!(!xml.contains("<shmem name='looking-glass'>"));
+        assert!(!xml.contains("ivshmem"));
+    }
+
+    fn dummy_vm_profile() -> VmProfile {
+        VmProfile {
+            vm_name: "virtu-windows".to_string(),
+            guest_os: GuestOs::Windows11,
+            ram_mb: 8192,
+            vcpu_count: 4,
+            disk_path: PathBuf::from("/var/lib/libvirt/images/virtu-windows.qcow2"),
+            disk_size_gb: 100,
+            disk_exists: false,
+            passthrough_gpu: dummy_gpu("0000:01:00.0", GpuVendor::Amd),
+            host_gpu: dummy_gpu("0000:02:00.0", GpuVendor::Nvidia),
+            passthrough_mode: PassthroughMode::DualGpu,
+            iso_path: None,
+            looking_glass: LookingGlassConfig::disabled(),
+            vm_monitor: None,
+            host_monitor: None,
+            evdev_keyboard: None,
+            evdev_mouse: None,
+            additional_evdev: Vec::new(),
+            use_hugepages: false,
+            use_cpu_pinning: false,
+            use_iothreads: false,
+            enable_tpm: true,
+            enable_hyperv: true,
+            enable_secure_boot: false,
+            audio_passthrough: AudioPassthroughMethod::None,
+            network_type: NetworkType::Nat,
+        }
+    }
+
+    fn dummy_gpu(slot: &str, vendor: GpuVendor) -> GpuInfo {
+        let (vendor_id, device_id, model_name) = match vendor {
+            GpuVendor::Nvidia => ("10de", "1f08", "NVIDIA test GPU"),
+            GpuVendor::Amd => ("1002", "7590", "AMD test GPU"),
+            GpuVendor::Intel => ("8086", "46a6", "Intel test GPU"),
+            GpuVendor::Unknown(_) => ("ffff", "ffff", "Unknown test GPU"),
+        };
+
+        GpuInfo {
+            pci_slot: slot.to_string(),
+            vendor,
+            gpu_type: GpuType::Discrete,
+            model_name: model_name.to_string(),
+            vendor_id: vendor_id.to_string(),
+            device_id: device_id.to_string(),
+            subsystem_vendor_id: "0000".to_string(),
+            subsystem_device_id: "0000".to_string(),
+            current_driver: None,
+            iommu_group_id: Some(1),
+            iommu_isolated: true,
+            rom_accessible: false,
+            companion_audio: None,
+            is_boot_vga: false,
+            vfio_compatible: true,
+            quirks: Vec::new(),
+        }
+    }
+
+    fn dummy_system_profile() -> SystemProfile {
+        SystemProfile {
+            cpu: CpuInfo {
+                vendor: "AuthenticAMD".to_string(),
+                model_name: "test".to_string(),
+                physical_cores: 4,
+                logical_cores: 8,
+                numa_nodes: Vec::new(),
+                iommu_capable: true,
+                iommu_enabled: true,
+                has_hyperthreading: true,
+                core_to_threads: HashMap::new(),
+            },
+            gpus: Vec::new(),
+            iommu_groups: Vec::new(),
+            ram: MemInfo {
+                total_kb: 16 * 1024 * 1024,
+                available_kb: 12 * 1024 * 1024,
+                hugepages_total: 0,
+                hugepages_free: 0,
+                hugepage_size_kb: 2048,
+            },
+            distro: DistroInfo {
+                id: "arch".to_string(),
+                id_like: Vec::new(),
+                pretty_name: "Arch".to_string(),
+                version_id: String::new(),
+                family: DistroFamily::Arch,
+                package_manager: PackageManager::Pacman,
+            },
+            bootloader: BootloaderInfo {
+                kind: BootloaderKind::Grub2,
+                config_path: None,
+                entry_paths: Vec::new(),
+                active_entry: None,
+                update_command: None,
+                is_uefi: true,
+            },
+            initramfs_system: InitramfsSystem::Mkinitcpio,
+            display_manager: DisplayManager::Unknown,
+            display_server: DisplayServer::Unknown,
+            audio: AudioSystem::Unknown,
+            monitors: Vec::new(),
+            usb_devices: Vec::new(),
+            storage: StorageInfo {
+                default_vm_dir: PathBuf::from("/var/lib/libvirt/images"),
+                available_bytes: 0,
+            },
+            virtualization: VirtInfo {
+                qemu_version: None,
+                libvirt_version: None,
+                virsh_available: false,
+                virt_manager_available: false,
+                libvirtd_running: false,
+            },
+            readiness: ReadinessInfo {
+                kernel_version: "6.10.0".to_string(),
+                kernel_cmdline: "BOOT_IMAGE=/vmlinuz".to_string(),
+                kernel_cmdline_params: Vec::new(),
+                loaded_modules: Vec::new(),
+                kernel_headers: KernelHeadersInfo {
+                    present: false,
+                    path: None,
+                },
+                secure_boot: false,
+                ovmf: OvmfInfo {
+                    code_paths: Vec::new(),
+                    vars_paths: Vec::new(),
+                },
+                user_access: UserAccessInfo {
+                    username: None,
+                    groups: Vec::new(),
+                    in_libvirt_group: false,
+                    in_kvm_group: false,
+                },
+                libvirt_domains: Vec::new(),
+            },
+            secure_boot: false,
+            kernel_cmdline: "BOOT_IMAGE=/vmlinuz".to_string(),
+            scan_timestamp: chrono::Utc::now(),
+        }
+    }
 }
