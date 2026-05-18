@@ -752,6 +752,7 @@ mod phase_b_tests {
             },
             remaining_steps: remaining,
             config: crate::vm::PassthroughConfig {
+                vm_name: "virtu-windows".to_string(),
                 gpu_mode: crate::vm::GpuPassthroughMode::DualGpu,
                 gpu_roles: Vec::new(),
                 monitor_plan: crate::vm::MonitorPlan::TwoMonitors {

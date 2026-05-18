@@ -44,6 +44,9 @@ impl std::fmt::Display for ValidationSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidationIssueId {
     CompatibilityBlocked,
+    VmNameEmpty,
+    VmNameInvalidChars,
+    VmNameCollidesWithDomain,
     GpuRolesEmpty,
     GpuRoleSlotUnknown,
     GpuRoleDuplicate,
@@ -80,6 +83,9 @@ impl std::fmt::Display for ValidationIssueId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             ValidationIssueId::CompatibilityBlocked => "compatibility-blocked",
+            ValidationIssueId::VmNameEmpty => "vm-name-empty",
+            ValidationIssueId::VmNameInvalidChars => "vm-name-invalid-chars",
+            ValidationIssueId::VmNameCollidesWithDomain => "vm-name-collides-with-domain",
             ValidationIssueId::GpuRolesEmpty => "gpu-roles-empty",
             ValidationIssueId::GpuRoleSlotUnknown => "gpu-role-slot-unknown",
             ValidationIssueId::GpuRoleDuplicate => "gpu-role-duplicate",
@@ -197,6 +203,7 @@ pub fn validate(
     let mut issues = Vec::new();
 
     propagate_blockers(report, &mut issues);
+    check_vm_name(profile, config, &mut issues);
     let mode = check_gpu_roles(profile, config, &mut issues);
     check_monitors(profile, config, &mut issues);
     check_looking_glass(config, mode, &mut issues);
@@ -207,6 +214,44 @@ pub fn validate(
     check_iso(config, &mut issues);
 
     ValidationReport { issues }
+}
+
+fn check_vm_name(
+    profile: &SystemProfile,
+    config: &PassthroughConfig,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if config.vm_name.is_empty() {
+        issues.push(ValidationIssue::error(
+            ValidationIssueId::VmNameEmpty,
+            "VM name is empty. Choose a name like `virtu-windows`.",
+        ));
+        return;
+    }
+    if !crate::vm::passthrough::is_valid_vm_name(&config.vm_name) {
+        issues.push(ValidationIssue::error(
+            ValidationIssueId::VmNameInvalidChars,
+            format!(
+                "VM name `{}` contains characters libvirt does not accept. Allowed: letters, digits, `_`, `.`, `+`, `-`.",
+                config.vm_name
+            ),
+        ));
+        return;
+    }
+    let collision = profile
+        .readiness
+        .libvirt_domains
+        .iter()
+        .any(|d| d.name == config.vm_name);
+    if collision {
+        issues.push(ValidationIssue::error(
+            ValidationIssueId::VmNameCollidesWithDomain,
+            format!(
+                "VM name `{}` is already registered with libvirt. Choose a different name or undefine the existing domain.",
+                config.vm_name
+            ),
+        ));
+    }
 }
 
 fn propagate_blockers(report: &CompatibilityReport, issues: &mut Vec<ValidationIssue>) {

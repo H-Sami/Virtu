@@ -576,3 +576,101 @@ async fn recommended_defaults_pass_validation_on_low_thread_hosts() {
     );
     assert!(config.resources.vcpu_count < profile.cpu.logical_cores);
 }
+
+#[tokio::test]
+async fn vm_name_default_is_present_and_valid() {
+    let profile = fixture_profile().await;
+    let config = PassthroughConfig::recommended_defaults(&profile).expect("config");
+    assert_eq!(config.vm_name, "virtu-windows");
+
+    let report = build_compatibility_report(&profile);
+    let result = validate(&profile, &report, &config);
+    let vm_name_errors: Vec<_> = result
+        .issues
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.id,
+                virtu::vm::ValidationIssueId::VmNameEmpty
+                    | virtu::vm::ValidationIssueId::VmNameInvalidChars
+                    | virtu::vm::ValidationIssueId::VmNameCollidesWithDomain
+            )
+        })
+        .collect();
+    assert!(
+        vm_name_errors.is_empty(),
+        "default vm_name must pass validation: {vm_name_errors:?}"
+    );
+}
+
+#[tokio::test]
+async fn vm_name_empty_is_rejected() {
+    let profile = fixture_profile().await;
+    let report = build_compatibility_report(&profile);
+    let mut config = PassthroughConfig::recommended_defaults(&profile).expect("config");
+    config.vm_name = String::new();
+
+    let result = validate(&profile, &report, &config);
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.id == virtu::vm::ValidationIssueId::VmNameEmpty));
+}
+
+#[tokio::test]
+async fn vm_name_invalid_characters_are_rejected() {
+    let profile = fixture_profile().await;
+    let report = build_compatibility_report(&profile);
+    let mut config = PassthroughConfig::recommended_defaults(&profile).expect("config");
+    // Spaces, slashes, and unicode letters are all rejected by libvirt.
+    for bad in ["my vm", "my/vm", "win10@home", "résumé", ""] {
+        config.vm_name = bad.to_string();
+        let result = validate(&profile, &report, &config);
+        let hit = result.issues.iter().any(|i| {
+            matches!(
+                i.id,
+                virtu::vm::ValidationIssueId::VmNameInvalidChars
+                    | virtu::vm::ValidationIssueId::VmNameEmpty
+            )
+        });
+        assert!(
+            hit,
+            "validate must reject vm_name {bad:?}; got issues: {:?}",
+            result.issues
+        );
+    }
+}
+
+#[tokio::test]
+async fn vm_name_collision_with_existing_libvirt_domain_is_rejected() {
+    let mut profile = fixture_profile().await;
+    profile
+        .readiness
+        .libvirt_domains
+        .push(virtu::detect::readiness::LibvirtDomainInfo {
+            id: None,
+            name: "virtu-windows".to_string(),
+            state: "shut off".to_string(),
+        });
+
+    let report = build_compatibility_report(&profile);
+
+    // recommended_defaults should now skip "virtu-windows" and pick
+    // "virtu-windows-2".
+    let recommended = PassthroughConfig::recommended_defaults(&profile).expect("config");
+    assert_eq!(recommended.vm_name, "virtu-windows-2");
+    let recommended_result = validate(&profile, &report, &recommended);
+    assert!(!recommended_result
+        .issues
+        .iter()
+        .any(|i| i.id == virtu::vm::ValidationIssueId::VmNameCollidesWithDomain));
+
+    // But a user-supplied colliding name must be rejected.
+    let mut colliding = recommended.clone();
+    colliding.vm_name = "virtu-windows".to_string();
+    let result = validate(&profile, &report, &colliding);
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.id == virtu::vm::ValidationIssueId::VmNameCollidesWithDomain));
+}

@@ -18,6 +18,12 @@ use std::path::PathBuf;
 /// Complete set of user choices that drive a Virtu passthrough plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassthroughConfig {
+    /// libvirt domain name. Used as the registered VM name and as the
+    /// basename for generated artifacts (`<vm_name>.xml`,
+    /// `<vm_name>.qcow2`). Must be unique across the host's existing
+    /// libvirt domains and must match libvirt's accepted character set.
+    pub vm_name: String,
+
     /// Overall passthrough strategy. The `gpu_roles` list must be consistent
     /// with this mode. See [`PassthroughConfig::derived_mode`] for the
     /// implied mode based on `gpu_roles` alone.
@@ -284,6 +290,7 @@ impl PassthroughConfig {
         };
 
         Some(PassthroughConfig {
+            vm_name: default_vm_name(profile),
             gpu_mode,
             gpu_roles,
             monitor_plan,
@@ -560,6 +567,41 @@ fn recommend_vcpu_count(profile: &SystemProfile) -> u32 {
 
 fn find_gpu<'a>(profile: &'a SystemProfile, slot: &str) -> Option<&'a GpuInfo> {
     profile.gpus.iter().find(|gpu| gpu.pci_slot == slot)
+}
+
+/// Default VM name. Tries `virtu-windows`, then `virtu-windows-2`, `-3`, ...
+/// until it finds one not already registered with libvirt. The user can
+/// override this through the upcoming wizard / CLI flags.
+pub(crate) fn default_vm_name(profile: &SystemProfile) -> String {
+    let base = "virtu-windows";
+    let existing: std::collections::HashSet<&str> = profile
+        .readiness
+        .libvirt_domains
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    if !existing.contains(base) {
+        return base.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = format!("{base}-{n}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    // Pathological host with 1000+ virtu-windows-N domains: fall back to a
+    // timestamp-suffixed name. Validation will still re-check uniqueness.
+    format!("{base}-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"))
+}
+
+/// Libvirt accepts only a narrow character set in domain names: letters,
+/// digits, `_`, `.`, `+`, and `-`. The name must not be empty.
+pub(crate) fn is_valid_vm_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-'))
 }
 
 #[cfg(test)]
