@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InitramfsSystem {
     Mkinitcpio,      // Arch Linux
     Dracut,          // Fedora, RHEL, OpenSUSE
@@ -27,15 +27,6 @@ impl InitramfsSystem {
             InitramfsSystem::Dracut => "dracut --force",
             InitramfsSystem::UpdateInitramfs => "update-initramfs -u -k all",
             InitramfsSystem::Unknown => "",
-        }
-    }
-
-    pub fn config_path(&self) -> Option<&str> {
-        match self {
-            InitramfsSystem::Mkinitcpio => Some("/etc/mkinitcpio.conf"),
-            InitramfsSystem::Dracut => Some("/etc/dracut.conf.d/"),
-            InitramfsSystem::UpdateInitramfs => Some("/etc/initramfs-tools/modules"),
-            InitramfsSystem::Unknown => None,
         }
     }
 }

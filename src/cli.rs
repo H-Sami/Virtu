@@ -20,6 +20,10 @@ pub enum Commands {
     /// Scan and display system compatibility report without making any changes
     Scan,
 
+    /// Build a dry-run plan from detected state and recommended user choices.
+    /// No host changes are made.
+    Plan,
+
     /// Roll back a previous Virtu configuration
     Rollback {
         /// List available snapshots

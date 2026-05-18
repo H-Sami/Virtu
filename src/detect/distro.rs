@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::debug;
@@ -67,9 +67,14 @@ impl PackageManager {
 pub async fn detect() -> Result<DistroInfo> {
     debug!("Detecting Linux distribution");
 
+    // /etc/os-release is missing only on systems that aren't standards-
+    // compliant Linux distros (or on Windows during fixture-driven tests
+    // that bypass live detection). Degrade gracefully rather than failing the
+    // whole scan; downstream rules already handle a `DistroFamily::Unknown`
+    // and a `PackageManager::Unknown`.
     let content = tokio::fs::read_to_string("/etc/os-release")
         .await
-        .context("Cannot read /etc/os-release")?;
+        .unwrap_or_default();
 
     Ok(parse_distro_info(&content))
 }

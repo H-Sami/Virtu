@@ -3,7 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
 use virtu::cli::{Cli, Commands};
-use virtu::{detect, snapshot, tui};
+use virtu::{detect, engine, snapshot, tui};
 
 fn setup_logging() -> Result<()> {
     let log_dir = dirs_home().join(".virtu").join("logs");
@@ -72,6 +72,22 @@ async fn main() -> Result<()> {
         Some(Commands::Scan) => {
             let profile = detect::scan_system().await?;
             detect::print_report(&profile);
+            let report = engine::build_compatibility_report(&profile);
+            report.print_human();
+        }
+        Some(Commands::Plan) => {
+            let profile = detect::scan_system().await?;
+            let report = engine::build_compatibility_report(&profile);
+            report.print_human();
+
+            let Some(config) = virtu::vm::PassthroughConfig::recommended_defaults(&profile) else {
+                println!("No GPUs detected; cannot build a plan.");
+                return Ok(());
+            };
+            match engine::plan(&profile, &report, &config) {
+                Ok(plan) => plan.print_human(),
+                Err(err) => println!("\nPlan refused: {err}"),
+            }
         }
         Some(Commands::Rollback { list, snapshot_id }) => {
             if list {

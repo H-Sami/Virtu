@@ -118,7 +118,7 @@ fn looks_like_pci_slot(value: &str) -> bool {
     bytes.len() >= 12
         && bytes.get(4) == Some(&b':')
         && bytes.get(7) == Some(&b':')
-        && bytes.iter().any(|byte| *byte == b'.')
+        && bytes.contains(&b'.')
 }
 
 fn normalize_pci_slot_name(name: &str) -> String {

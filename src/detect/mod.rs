@@ -58,34 +58,8 @@ pub struct SystemProfile {
 }
 
 impl SystemProfile {
-    /// Returns all GPUs that are candidates for VFIO passthrough.
-    pub fn passthrough_candidates(&self) -> Vec<&GpuInfo> {
-        self.gpus
-            .iter()
-            .filter(|g| g.iommu_isolated && g.current_driver.as_deref() != Some("vfio-pci"))
-            .collect()
-    }
-
     pub fn iommu_active(&self) -> bool {
         !self.iommu_groups.is_empty()
-    }
-
-    pub fn boot_gpu(&self) -> Option<&GpuInfo> {
-        self.gpus.iter().find(|g| g.is_boot_vga)
-    }
-
-    pub fn igpus(&self) -> Vec<&GpuInfo> {
-        self.gpus
-            .iter()
-            .filter(|g| g.gpu_type == gpu::GpuType::Integrated)
-            .collect()
-    }
-
-    pub fn dgpus(&self) -> Vec<&GpuInfo> {
-        self.gpus
-            .iter()
-            .filter(|g| g.gpu_type == gpu::GpuType::Discrete)
-            .collect()
     }
 }
 
@@ -163,9 +137,9 @@ pub async fn scan_system() -> Result<SystemProfile> {
     Ok(profile)
 }
 
-/// Print a human-readable compatibility report to stdout.
+/// Print a human-readable system scan summary to stdout.
 pub fn print_report(profile: &SystemProfile) {
-    println!("\n=== VIRTU COMPATIBILITY REPORT ===");
+    println!("\n=== VIRTU SYSTEM SCAN ===");
     println!(
         "CPU:         {} ({})",
         profile.cpu.model_name, profile.cpu.vendor

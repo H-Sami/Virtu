@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn test_compress_cpu_list_ranges() {
-        let ids: Vec<String> = vec!["6", "7", "14", "15"]
+        let ids: Vec<String> = ["6", "7", "14", "15"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_compress_single() {
-        let ids: Vec<String> = vec!["4"].iter().map(|s| s.to_string()).collect();
+        let ids: Vec<String> = ["4"].iter().map(|s| s.to_string()).collect();
         assert_eq!(compress_cpu_list(&ids), "4");
     }
 }

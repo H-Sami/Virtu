@@ -253,7 +253,12 @@ async fn detect_companion_audio(sysfs_root: &Path, gpu_slot: &str) -> Option<Com
             continue;
         }
 
-        let class = read_sysfs_str(&candidate_path.join("class")).await?;
+        let Some(class) = read_sysfs_str(&candidate_path.join("class")).await else {
+            // A sibling function exists but has no class file. That can
+            // happen on partial fixture roots; keep scanning instead of
+            // bailing out early.
+            continue;
+        };
         let class = class.trim().to_lowercase();
         if !(class.starts_with("0x0401") || class.starts_with("0x0403")) {
             continue;

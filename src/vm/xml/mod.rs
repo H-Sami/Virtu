@@ -161,7 +161,7 @@ impl<'a> XmlBuilder<'a> {
         writeln!(xml, "    <cache mode='passthrough'/>")?;
 
         // AMD-specific: expose topology extension for correct core detection in guest
-        if self.system.cpu.vendor.contains("AMD") || self.system.cpu.vendor == "AuthenticAMD" {
+        if self.system.cpu.vendor.contains("AMD") {
             writeln!(xml, "    <feature policy='require' name='topoext'/>")?;
         }
 
@@ -430,7 +430,7 @@ impl<'a> XmlBuilder<'a> {
         if gpu.rom_accessible {
             let rom_path = format!(
                 "/var/lib/libvirt/vbios/{}.rom",
-                gpu.pci_slot.replace(':', "_").replace('.', "_")
+                gpu.pci_slot.replace([':', '.'], "_")
             );
             writeln!(xml, "      <rom file='{rom_path}'/>")?;
         }
@@ -516,7 +516,7 @@ fn parse_pci_slot(slot: &str) -> Option<(u32, u32, u32, u32)> {
     let domain = u32::from_str_radix(parts[0], 16).ok()?;
     let bus = u32::from_str_radix(parts[1], 16).ok()?;
     let dev_fn: Vec<&str> = parts[2].split('.').collect();
-    let device = u32::from_str_radix(dev_fn.get(0)?, 16).ok()?;
+    let device = u32::from_str_radix(dev_fn.first()?, 16).ok()?;
     let function = u32::from_str_radix(dev_fn.get(1)?, 16).ok()?;
     Some((domain, bus, device, function))
 }

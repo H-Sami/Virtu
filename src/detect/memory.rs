@@ -22,25 +22,34 @@ impl MemInfo {
         self.available_kb / 1_048_576
     }
 
-    /// Recommended VM RAM: half of total, min 4GB, max (total - 4GB)
+    /// Recommended VM RAM in MiB.
+    ///
+    /// Aims for half of host RAM, with a 4 GiB floor and a 4 GiB host
+    /// reserve. On hosts with too little RAM to satisfy both bounds, the host
+    /// reserve wins so the host stays usable; the floor is treated as a
+    /// suggestion, not a guarantee. Returns 0 only when total RAM is 0
+    /// (e.g. an empty fixture).
     pub fn recommended_vm_ram_mb(&self) -> u64 {
         let total_mb = self.total_kb / 1024;
-        let half = total_mb / 2;
-        let min = 4096u64;
-        let max = total_mb.saturating_sub(4096);
-        half.clamp(min, max)
-    }
+        if total_mb == 0 {
+            return 0;
+        }
 
-    /// Calculate hugepages needed for a given VM RAM in MB
-    pub fn hugepages_for_vm_ram(&self, vm_ram_mb: u64) -> u64 {
-        if self.hugepage_size_kb == 0 {
+        let host_reserve_mb = 4096u64;
+        let preferred_floor = 4096u64;
+
+        // Always leave at least the host reserve for the host. If the host
+        // has less than the reserve, give it everything anyway and return 0.
+        let max_for_vm = total_mb.saturating_sub(host_reserve_mb);
+        if max_for_vm == 0 {
             return 0;
         }
-        let hugepage_mb = self.hugepage_size_kb / 1024;
-        if hugepage_mb == 0 {
-            return 0;
-        }
-        (vm_ram_mb + hugepage_mb - 1) / hugepage_mb + 1 // +1 for overhead
+
+        let half = total_mb / 2;
+        // Prefer half-of-RAM, but never exceed `total - reserve`.
+        let target = half.min(max_for_vm);
+        // Bring it up toward the floor only when there is room.
+        target.max(preferred_floor.min(max_for_vm))
     }
 }
 
