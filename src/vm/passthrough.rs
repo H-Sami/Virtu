@@ -410,14 +410,34 @@ fn recommend_gpu_assignment(gpus: &[GpuInfo]) -> (GpuPassthroughMode, Vec<GpuRol
         return (GpuPassthroughMode::IgpuHost, roles);
     }
 
-    // Two or more GPUs of the same kind. Pick a passthrough candidate that is
-    // not the boot VGA when possible, and leave the boot VGA on the host.
-    let host_candidate = gpus.iter().find(|g| g.is_boot_vga).unwrap_or(&gpus[0]);
+    // Two or more GPUs of the same kind. Pick the passthrough candidate by
+    // priority:
+    //   1. An IOMMU-isolated GPU that is NOT the boot VGA. The boot VGA is
+    //      where the firmware drew the splash screen and where Linux first
+    //      hands display to the user; keeping it on the host avoids losing
+    //      the host's display when vfio-pci binds.
+    //   2. Any IOMMU-isolated GPU. If only the boot VGA is isolated, use it
+    //      and let the user override (they may want NVIDIA-on-host with
+    //      AMD passing through, or vice versa).
+    //   3. Any non-boot-VGA GPU, isolated or not. Validation will surface
+    //      the missing isolation as an error so the user is told why.
+    //   4. Fallback to gpus[1] when no other candidate fits, e.g. two
+    //      indistinguishable cards.
+    //
+    // Host candidate is then "anything that isn't the chosen passthrough
+    // card", preferring the boot VGA so the host display remains stable.
     let pass_candidate = gpus
         .iter()
-        .find(|g| g.pci_slot != host_candidate.pci_slot && g.iommu_isolated)
-        .or_else(|| gpus.iter().find(|g| g.pci_slot != host_candidate.pci_slot))
+        .find(|g| g.iommu_isolated && !g.is_boot_vga)
+        .or_else(|| gpus.iter().find(|g| g.iommu_isolated))
+        .or_else(|| gpus.iter().find(|g| !g.is_boot_vga))
         .unwrap_or(&gpus[1]);
+
+    let host_candidate = gpus
+        .iter()
+        .find(|g| g.is_boot_vga && g.pci_slot != pass_candidate.pci_slot)
+        .or_else(|| gpus.iter().find(|g| g.pci_slot != pass_candidate.pci_slot))
+        .unwrap_or(&gpus[0]);
 
     let mut roles: Vec<GpuRoleAssignment> = Vec::with_capacity(gpus.len());
     for gpu in gpus {
@@ -540,4 +560,100 @@ fn recommend_vcpu_count(profile: &SystemProfile) -> u32 {
 
 fn find_gpu<'a>(profile: &'a SystemProfile, slot: &str) -> Option<&'a GpuInfo> {
     profile.gpus.iter().find(|gpu| gpu.pci_slot == slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::gpu::{GpuType, GpuVendor};
+
+    fn dgpu(pci_slot: &str, vendor: GpuVendor, isolated: bool, boot_vga: bool) -> GpuInfo {
+        GpuInfo {
+            pci_slot: pci_slot.to_string(),
+            vendor,
+            gpu_type: GpuType::Discrete,
+            model_name: "test gpu".to_string(),
+            vendor_id: "0000".to_string(),
+            device_id: "0000".to_string(),
+            subsystem_vendor_id: "0000".to_string(),
+            subsystem_device_id: "0000".to_string(),
+            current_driver: None,
+            iommu_group_id: None,
+            iommu_isolated: isolated,
+            rom_accessible: true,
+            companion_audio: None,
+            is_boot_vga: boot_vga,
+            vfio_compatible: isolated,
+            quirks: Vec::new(),
+        }
+    }
+
+    /// Regression: a host with two dGPUs where the boot VGA is the only
+    /// isolated card (e.g. AMD on CPU PCIe + NVIDIA on chipset PCIe) must
+    /// pick the isolated card for passthrough, not the non-isolated one.
+    /// The previous logic preferred "not the boot VGA" first and produced a
+    /// non-isolated passthrough recommendation, which the validator then
+    /// correctly refused.
+    #[test]
+    fn dual_dgpu_picks_isolated_card_for_passthrough_even_when_boot_vga() {
+        let amd_isolated_boot_vga = dgpu("0000:2d:00.0", GpuVendor::Amd, true, true);
+        let nvidia_chipset_routed = dgpu("0000:04:00.0", GpuVendor::Nvidia, false, false);
+        let gpus = vec![amd_isolated_boot_vga.clone(), nvidia_chipset_routed.clone()];
+
+        let (mode, roles) = recommend_gpu_assignment(&gpus);
+        assert_eq!(mode, GpuPassthroughMode::DualGpu);
+
+        let pass_role = roles
+            .iter()
+            .find(|r| r.role == GpuRole::Passthrough)
+            .expect("a passthrough role must be assigned");
+        assert_eq!(
+            pass_role.pci_slot, amd_isolated_boot_vga.pci_slot,
+            "the isolated GPU must be picked for passthrough"
+        );
+
+        let host_role = roles
+            .iter()
+            .find(|r| r.role == GpuRole::Host)
+            .expect("a host role must be assigned");
+        assert_eq!(
+            host_role.pci_slot, nvidia_chipset_routed.pci_slot,
+            "the non-isolated GPU must be host"
+        );
+    }
+
+    /// Standard dual-dGPU layout where the isolated card is NOT the boot
+    /// VGA still picks the isolated card for passthrough.
+    #[test]
+    fn dual_dgpu_prefers_isolated_non_boot_vga_when_available() {
+        let host_card = dgpu("0000:01:00.0", GpuVendor::Nvidia, false, true);
+        let pass_card = dgpu("0000:0a:00.0", GpuVendor::Amd, true, false);
+        let gpus = vec![host_card.clone(), pass_card.clone()];
+
+        let (_, roles) = recommend_gpu_assignment(&gpus);
+        let pass_role = roles
+            .iter()
+            .find(|r| r.role == GpuRole::Passthrough)
+            .expect("a passthrough role must be assigned");
+        assert_eq!(pass_role.pci_slot, pass_card.pci_slot);
+    }
+
+    /// Two non-isolated dGPUs is a degenerate case: the recommendation
+    /// still produces a plan (the user may want to enable ACS override or
+    /// just see the plan) but it falls back to "non-boot-VGA as
+    /// passthrough". Validation will then fail loudly because neither card
+    /// is isolated, which is the correct outcome.
+    #[test]
+    fn dual_dgpu_with_no_isolation_falls_back_to_non_boot_vga() {
+        let boot_vga_card = dgpu("0000:01:00.0", GpuVendor::Nvidia, false, true);
+        let other_card = dgpu("0000:0a:00.0", GpuVendor::Amd, false, false);
+        let gpus = vec![boot_vga_card.clone(), other_card.clone()];
+
+        let (_, roles) = recommend_gpu_assignment(&gpus);
+        let pass_role = roles
+            .iter()
+            .find(|r| r.role == GpuRole::Passthrough)
+            .expect("a passthrough role must be assigned");
+        assert_eq!(pass_role.pci_slot, other_card.pci_slot);
+    }
 }
