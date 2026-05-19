@@ -15,20 +15,16 @@ path = "src/main.rs"
 [dependencies]
 # TUI
 ratatui        = "0.26"
-crossterm      = { version = "0.27", features = ["event-stream"] }
+crossterm      = "0.27"
 
-# Async runtime
+# Async runtime. The `full` feature is convenient but pulls in more
+# than Virtu strictly needs; trimming it is scoped for a Phase-10
+# polish pass once the feature surface stabilizes.
 tokio          = { version = "1", features = ["full"] }
-tokio-stream   = "0.1"
-futures        = "0.3"
 
 # Serialization
 serde          = { version = "1", features = ["derive"] }
 toml           = "0.8"
-serde_json     = "1"
-
-# XML generation
-quick-xml      = { version = "0.31", features = ["serialize", "async-tokio"] }
 
 # Error handling
 anyhow         = "1"
@@ -62,17 +58,14 @@ hex            = "0.4"
 # Regex (error pattern matching in diagnostics)
 regex          = "1"
 
-# UUID for snapshot IDs
+# UUID for libvirt domain XML <uuid> generation
 uuid           = { version = "1", features = ["v4"] }
 
-# Terminal input for privilege escalation prompts
-rpassword      = "7"
-
 [dev-dependencies]
-mockall        = "0.12"
+# `tempfile` is also a runtime dep, but cargo permits the duplicate
+# declaration so dev-only features can be added later without
+# touching the release surface.
 tempfile       = "3"
-assert_fs      = "1"
-predicates     = "3"
 
 [profile.release]
 opt-level     = 3
