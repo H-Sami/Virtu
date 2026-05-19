@@ -138,11 +138,23 @@ pub fn parse_virsh_list_all(output: &str) -> Vec<LibvirtDomainInfo> {
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty() || line.starts_with("Id ") || line.starts_with("---") {
+            if line.is_empty() {
                 return None;
             }
 
             let parts: Vec<&str> = line.split_whitespace().collect();
+            // Skip the column header (`Id   Name   State`) by matching
+            // the literal first two tokens together rather than just
+            // `parts[0] == "Id"`. This keeps a domain literally named
+            // `Id` from being silently dropped (virsh disallows that
+            // name in practice, but defensive parsing is cheap).
+            if parts.first() == Some(&"Id") && parts.get(1) == Some(&"Name") {
+                return None;
+            }
+            // Skip the `--------` separator line.
+            if line.starts_with("---") {
+                return None;
+            }
             if parts.len() < 3 {
                 return None;
             }
