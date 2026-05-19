@@ -491,12 +491,13 @@ fn looking_glass_step(install_mode: crate::vm::LookingGlassInstallMode) -> Plann
 }
 
 fn vm_xml_step(config: &PassthroughConfig) -> PlannedStep {
+    let xml_filename = format!("{}.xml", config.vm_name);
     let xml_path: PathBuf = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".virtu")
-        .join("vm.xml");
+        .join(&xml_filename);
 
     let summary = match &config.resources.disk {
         crate::vm::DiskChoice::Create {
@@ -504,30 +505,38 @@ fn vm_xml_step(config: &PassthroughConfig) -> PlannedStep {
             size_gb,
             format,
         } => format!(
-            "Generate libvirt domain XML targeting a new {} GiB {} image at {}.",
-            size_gb,
-            format.extension(),
-            path.display()
+            "Generate libvirt domain XML for `{name}` targeting a new {size} GiB {fmt} image at {path}.",
+            name = config.vm_name,
+            size = size_gb,
+            fmt = format.extension(),
+            path = path.display()
         ),
         crate::vm::DiskChoice::Existing { path } => format!(
-            "Generate libvirt domain XML referencing the existing disk image at {}.",
-            path.display()
+            "Generate libvirt domain XML for `{name}` referencing the existing disk image at {path}.",
+            name = config.vm_name,
+            path = path.display()
         ),
     };
 
+    let validate_command = format!("virt-xml-validate {}", xml_path.display());
+
     PlannedStep {
         kind: StepKind::VmXmlGenerate,
-        title: "Generate libvirt domain XML".to_string(),
+        title: format!("Generate libvirt domain XML for {}", config.vm_name),
         summary,
         risk: StepRisk::Low,
         privilege: PrivilegeNeed::User,
         state: StepState::Pending,
-        touches: vec![xml_path],
-        commands: vec!["virt-xml-validate <generated.xml>".to_string()],
-        verification: "Run `virt-xml-validate` against the generated XML and confirm exit code 0."
-            .to_string(),
-        rollback: "Delete the generated XML file. No host configuration is changed by this step."
-            .to_string(),
+        touches: vec![xml_path.clone()],
+        commands: vec![validate_command],
+        verification: format!(
+            "Run `virt-xml-validate {}` and confirm exit code 0.",
+            xml_path.display()
+        ),
+        rollback: format!(
+            "Delete the generated XML file at {}. No host configuration is changed by this step.",
+            xml_path.display()
+        ),
         requires_reboot: false,
         requires_confirmation: false,
     }
@@ -550,17 +559,23 @@ fn vm_register_step(config: &PassthroughConfig) -> PlannedStep {
             size = size_gb
         ));
     }
-    commands.push("virsh define <generated.xml>".to_string());
+    commands.push(format!("virsh define ~/.virtu/{}.xml", config.vm_name));
 
     let summary = if needs_disk_create {
-        "Create the VM disk image with `qemu-img create`, then register the libvirt domain with `virsh define`.".to_string()
+        format!(
+            "Create the VM disk image with `qemu-img create`, then register libvirt domain `{name}` with `virsh define`.",
+            name = config.vm_name
+        )
     } else {
-        "Register the libvirt domain with `virsh define`.".to_string()
+        format!(
+            "Register libvirt domain `{name}` with `virsh define`.",
+            name = config.vm_name
+        )
     };
 
     PlannedStep {
         kind: StepKind::VmRegister,
-        title: "Register the libvirt domain".to_string(),
+        title: format!("Register libvirt domain `{}`", config.vm_name),
         summary,
         risk: StepRisk::Low,
         privilege: PrivilegeNeed::User,
@@ -570,8 +585,14 @@ fn vm_register_step(config: &PassthroughConfig) -> PlannedStep {
             crate::vm::DiskChoice::Existing { .. } => Vec::new(),
         },
         commands,
-        verification: "Run `virsh dominfo <name>` and confirm the domain exists; `virsh list --all` should include it.".to_string(),
-        rollback: "Run `virsh undefine` and remove the generated disk image if it was created in this step.".to_string(),
+        verification: format!(
+            "Run `virsh dominfo {name}` and confirm the domain exists; `virsh list --all` should include `{name}`.",
+            name = config.vm_name
+        ),
+        rollback: format!(
+            "Run `virsh undefine {name}` and remove the generated disk image if it was created in this step.",
+            name = config.vm_name
+        ),
         requires_reboot: false,
         requires_confirmation: false,
     }

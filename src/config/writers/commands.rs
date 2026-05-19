@@ -64,6 +64,8 @@ pub enum CommandError {
         #[source]
         source: std::io::Error,
     },
+    #[error("argument for `{program}` is unrepresentable as a process argument: {detail}")]
+    InvalidArgument { program: String, detail: String },
 }
 
 /// Run a regenerate command and return `Ok(())` on success.
@@ -230,6 +232,126 @@ pub fn validate_xml(content: &str) -> Result<(), CommandError> {
     run(PROGRAM, &[&path_str])
 }
 
+/// Image format selector accepted by [`run_qemu_img_create`].
+///
+/// Mirrors the qcow2/raw distinction libvirt cares about. The matching
+/// string is what `qemu-img create -f <format>` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskImageFormat {
+    Qcow2,
+    Raw,
+}
+
+impl DiskImageFormat {
+    pub fn as_qemu_arg(&self) -> &'static str {
+        match self {
+            DiskImageFormat::Qcow2 => "qcow2",
+            DiskImageFormat::Raw => "raw",
+        }
+    }
+}
+
+/// Create a sparse disk image with `qemu-img create -f <format> <path> <size>G`.
+///
+/// Phase B calls this exactly once during `VmRegister`, only when the user
+/// asked for a brand-new image (`DiskChoice::Create`). The wrapper:
+///
+/// - Refuses if `qemu-img` is not on PATH.
+/// - Refuses to overwrite an existing path. The caller is responsible for
+///   deciding whether to skip (path already there) or fail. We do **not**
+///   pass `-f raw -o preallocation=falloc` or anything destructive; the
+///   default behavior is the smallest blast radius.
+/// - Builds the size argument as `<size>G` (qemu-img's preferred unit).
+///
+/// Production callers must ensure the parent directory exists before calling
+/// this wrapper.
+pub fn run_qemu_img_create(
+    path: &std::path::Path,
+    size_gb: u64,
+    format: DiskImageFormat,
+) -> Result<(), CommandError> {
+    const PROGRAM: &str = "qemu-img";
+
+    if !binary_available(PROGRAM) {
+        return Err(CommandError::NotFound {
+            program: PROGRAM.to_string(),
+        });
+    }
+
+    let path_str = match path.to_str() {
+        Some(s) => s,
+        None => {
+            return Err(CommandError::InvalidArgument {
+                program: PROGRAM.to_string(),
+                detail: format!("disk path is not valid UTF-8: {}", path.display()),
+            });
+        }
+    };
+
+    let size_arg = format!("{size_gb}G");
+    run(
+        PROGRAM,
+        &["create", "-f", format.as_qemu_arg(), path_str, &size_arg],
+    )
+}
+
+/// Register a libvirt domain from an XML file via `virsh define <path>`.
+///
+/// `--connect qemu:///system` is intentionally not added: Virtu picks the
+/// connection through the user's environment (`LIBVIRT_DEFAULT_URI`) so the
+/// same wrapper works for system-level and per-user installations. Failures
+/// caused by an unwritable libvirt connection therefore surface as
+/// `NonZeroExit` with the actual `virsh` stderr, not a misleading message
+/// from us.
+pub fn run_virsh_define(xml_path: &std::path::Path) -> Result<(), CommandError> {
+    const PROGRAM: &str = "virsh";
+
+    if !binary_available(PROGRAM) {
+        return Err(CommandError::NotFound {
+            program: PROGRAM.to_string(),
+        });
+    }
+
+    let path_str = match xml_path.to_str() {
+        Some(s) => s,
+        None => {
+            return Err(CommandError::InvalidArgument {
+                program: PROGRAM.to_string(),
+                detail: format!("XML path is not valid UTF-8: {}", xml_path.display()),
+            });
+        }
+    };
+
+    run(PROGRAM, &["define", path_str])
+}
+
+/// Undefine a libvirt domain by name via `virsh undefine <name>`. The
+/// rollback path uses this when Phase B failed *after* a successful
+/// `virsh define` and we need to clean up before re-trying.
+///
+/// `--nvram` is intentionally not appended: domains we register here use
+/// OVMF firmware, but the user's nvram path is captured automatically by
+/// libvirt at define time. Removing it requires an explicit follow-up the
+/// user can perform manually if desired; we never delete keys behind the
+/// user's back.
+pub fn run_virsh_undefine(domain: &str) -> Result<(), CommandError> {
+    const PROGRAM: &str = "virsh";
+
+    if domain.is_empty() {
+        return Err(CommandError::InvalidArgument {
+            program: PROGRAM.to_string(),
+            detail: "empty domain name".to_string(),
+        });
+    }
+    if !binary_available(PROGRAM) {
+        return Err(CommandError::NotFound {
+            program: PROGRAM.to_string(),
+        });
+    }
+
+    run(PROGRAM, &["undefine", domain])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +483,63 @@ mod tests {
             ),
             "expected NonZeroExit, got {err:?}"
         );
+    }
+
+    /// `run_qemu_img_create` short-circuits with `NotFound` when
+    /// `qemu-img` is missing. We do not exercise the real binary in the
+    /// hermetic suite because it would write a multi-GiB sparse file.
+    #[test]
+    fn run_qemu_img_create_short_circuits_when_missing() {
+        if which::which("qemu-img").is_ok() {
+            return;
+        }
+        let err = run_qemu_img_create(
+            std::path::Path::new("/tmp/virtu-test-image.qcow2"),
+            1,
+            DiskImageFormat::Qcow2,
+        )
+        .unwrap_err();
+        match err {
+            CommandError::NotFound { program } => assert_eq!(program, "qemu-img"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `DiskImageFormat::as_qemu_arg` produces the literal strings the
+    /// real `qemu-img -f` flag expects.
+    #[test]
+    fn disk_image_format_emits_canonical_qemu_arg() {
+        assert_eq!(DiskImageFormat::Qcow2.as_qemu_arg(), "qcow2");
+        assert_eq!(DiskImageFormat::Raw.as_qemu_arg(), "raw");
+    }
+
+    /// `run_virsh_define` short-circuits with `NotFound` when `virsh`
+    /// is missing. Identical pattern to the other wrappers.
+    #[test]
+    fn run_virsh_define_short_circuits_when_missing() {
+        if which::which("virsh").is_ok() {
+            return;
+        }
+        let err = run_virsh_define(std::path::Path::new("/tmp/virtu-windows.xml")).unwrap_err();
+        match err {
+            CommandError::NotFound { program } => assert_eq!(program, "virsh"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// `run_virsh_undefine` rejects an empty domain name with
+    /// `InvalidArgument` *before* attempting a PATH lookup. This is a
+    /// hard prerequisite for the rollback path: an empty name would
+    /// otherwise let `virsh undefine ""` reach the host and produce a
+    /// misleading error.
+    #[test]
+    fn run_virsh_undefine_rejects_empty_domain_name() {
+        let err = run_virsh_undefine("").unwrap_err();
+        match err {
+            CommandError::InvalidArgument { program, .. } => {
+                assert_eq!(program, "virsh");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }

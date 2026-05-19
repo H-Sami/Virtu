@@ -551,6 +551,59 @@ pub enum PhaseBError {
     },
     #[error("step {step:?}: {detail}")]
     Step { step: StepKind, detail: String },
+    #[error("step {step:?}: VM XML generation failed: {source}")]
+    XmlGenerate {
+        step: StepKind,
+        #[source]
+        source: crate::vm::xml::XmlError,
+    },
+    #[error("step {step:?}: virt-xml-validate rejected the generated XML: {source}")]
+    XmlValidate {
+        step: StepKind,
+        #[source]
+        source: crate::config::writers::commands::CommandError,
+    },
+    #[error("step {step:?}: snapshot-aware write failed: {source}")]
+    Persist {
+        step: StepKind,
+        #[source]
+        source: SnapshotError,
+    },
+    #[error(
+        "step {step:?}: qemu-img create failed for {path}; rollback already cleaned up the partial image: {source}"
+    )]
+    DiskCreate {
+        step: StepKind,
+        path: PathBuf,
+        #[source]
+        source: crate::config::writers::commands::CommandError,
+    },
+    #[error(
+        "step {step:?}: virsh define failed; the libvirt domain was NOT registered. The disk image at {disk:?} has been left on disk for inspection: {source}"
+    )]
+    VirshDefine {
+        step: StepKind,
+        disk: Option<PathBuf>,
+        #[source]
+        source: crate::config::writers::commands::CommandError,
+    },
+}
+
+/// Whether [`execute_phase_b`] should invoke the host commands its steps
+/// declare (`virt-xml-validate`, `qemu-img create`, `virsh define`).
+///
+/// Tests use [`HostCommandMode::Skip`] so the in-memory filesystem stays
+/// hermetic; the CLI uses [`HostCommandMode::Run`] for real execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCommandMode {
+    /// Generate XML and run all read-only logic, but do not invoke
+    /// `virt-xml-validate`, `qemu-img create`, or `virsh define`. Phase B
+    /// returns success after staging the XML and recording the disk-image
+    /// entry. Used in tests so the in-memory filesystem stays hermetic.
+    Skip,
+    /// Invoke every host command. Failures abort Phase B and surface a
+    /// structured error.
+    Run,
 }
 
 impl PhaseBError {
@@ -587,12 +640,19 @@ pub struct PhaseBOutcome {
 /// confirmed `Ready`. This split keeps the executor focused on action and
 /// lets the verifier stay a pure function.
 ///
-/// Today, the only mutating step kinds Phase B can produce are still
-/// scoped for later milestones (hooks → M9, Looking Glass → M8, VM XML +
-/// libvirt registration → M7). For each one we record a `deferred` entry
-/// and print a clear "not implemented yet" message. The read-only
-/// `StepKind::Verify` step is executed: it re-runs detection one more time
-/// and prints a final-state summary.
+/// As of slice 7.6, the executor runs `VmXmlGenerate` and `VmRegister`
+/// itself. `HookInstall` (Milestone 9) and `LookingGlassInstall`
+/// (permanently cut from v1.0) are still recorded as `deferred_steps`.
+/// The read-only `Verify` step prints a final-state summary.
+///
+/// `snapshots_root` is required so the executor can update the manifest
+/// (the XML file Phase B writes is recorded there for rollback). The
+/// manifest is re-read after the `VmXmlGenerate` step writes so the
+/// matching `SnapshotEntry` carries an up-to-date post-edit hash.
+///
+/// `host_command_mode` controls whether `virt-xml-validate`, `qemu-img
+/// create`, and `virsh define` are actually invoked. Tests use
+/// [`HostCommandMode::Skip`].
 ///
 /// Once every step has been processed (executed, deferred, or skipped),
 /// Phase B clears `pending.toml`. The host is then back to a "no
@@ -602,7 +662,9 @@ pub fn execute_phase_b(
     pending: &PendingPlan,
     profile_after_reboot: &SystemProfile,
     filesystem: &impl FileSystem,
+    snapshots_root: &Path,
     state_root: &Path,
+    host_command_mode: HostCommandMode,
 ) -> Result<PhaseBOutcome, PhaseBError> {
     let mut outcome = PhaseBOutcome {
         snapshot_id: pending.snapshot_id.clone(),
@@ -610,6 +672,10 @@ pub fn execute_phase_b(
         deferred_steps: Vec::new(),
         pending_cleared: false,
     };
+
+    // Load the existing manifest so VmXmlGenerate / VmRegister can use
+    // snapshot_then_write through it.
+    let mut manifest = read_manifest(filesystem, snapshots_root, &pending.snapshot_id)?;
 
     for step in &pending.remaining_steps {
         match step.kind {
@@ -630,13 +696,36 @@ pub fn execute_phase_b(
                 });
             }
 
-            // Future milestones own these; for now Phase B records them as
-            // deferred so the CLI can surface a clear "still on the
-            // roadmap" message.
-            StepKind::HookInstall
-            | StepKind::LookingGlassInstall
-            | StepKind::VmXmlGenerate
-            | StepKind::VmRegister => {
+            StepKind::VmXmlGenerate => {
+                run_vm_xml_step(
+                    step,
+                    pending,
+                    profile_after_reboot,
+                    filesystem,
+                    snapshots_root,
+                    &mut manifest,
+                    host_command_mode,
+                )?;
+                outcome.completed_steps.push(StepKind::VmXmlGenerate);
+            }
+
+            StepKind::VmRegister => {
+                run_vm_register_step(
+                    step,
+                    pending,
+                    filesystem,
+                    snapshots_root,
+                    &mut manifest,
+                    host_command_mode,
+                )?;
+                outcome.completed_steps.push(StepKind::VmRegister);
+            }
+
+            // Future / cut milestones own these; for now Phase B records
+            // them as deferred so the CLI can surface a clear "still on the
+            // roadmap" message. LookingGlassInstall is permanently
+            // deferred per the v1.0 cut.
+            StepKind::HookInstall | StepKind::LookingGlassInstall => {
                 outcome.deferred_steps.push(step.kind.clone());
             }
 
@@ -659,6 +748,259 @@ pub fn execute_phase_b(
     }
 
     Ok(outcome)
+}
+
+fn read_manifest(
+    filesystem: &impl FileSystem,
+    snapshots_root: &Path,
+    snapshot_id: &str,
+) -> Result<SnapshotManifest, PhaseBError> {
+    let manifest_path = snapshots_root
+        .join(snapshot_id)
+        .join(crate::snapshot::MANIFEST_FILENAME);
+    let bytes = filesystem
+        .read(&manifest_path)
+        .map_err(|source| PhaseBError::io(&manifest_path, source))?;
+    let text = String::from_utf8(bytes).map_err(|err| {
+        PhaseBError::io(
+            manifest_path.clone(),
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        )
+    })?;
+    toml::from_str::<SnapshotManifest>(&text).map_err(|source| PhaseBError::Step {
+        step: StepKind::Snapshot,
+        detail: format!(
+            "manifest at {} is not parseable: {source}",
+            manifest_path.display()
+        ),
+    })
+}
+
+fn write_manifest(
+    filesystem: &impl FileSystem,
+    snapshots_root: &Path,
+    snapshot_id: &str,
+    manifest: &SnapshotManifest,
+) -> Result<(), PhaseBError> {
+    let manifest_path = snapshots_root
+        .join(snapshot_id)
+        .join(crate::snapshot::MANIFEST_FILENAME);
+    let serialized = toml::to_string(manifest).map_err(|source| PhaseBError::Step {
+        step: StepKind::Snapshot,
+        detail: format!("serializing manifest: {source}"),
+    })?;
+    filesystem
+        .write_atomic(&manifest_path, serialized.as_bytes())
+        .map_err(|source| PhaseBError::io(&manifest_path, source))?;
+    Ok(())
+}
+
+/// Generate the libvirt domain XML and persist it under
+/// `~/.virtu/<vm_name>.xml` through `snapshot_then_write`.
+///
+/// The XML path is taken from the planner's declared `touches`; the planner
+/// keys the path on `vm_name`. We do not invent the path here so a planner
+/// change cannot silently desync from the executor.
+fn run_vm_xml_step(
+    step: &PlannedStep,
+    pending: &PendingPlan,
+    profile: &SystemProfile,
+    filesystem: &impl FileSystem,
+    snapshots_root: &Path,
+    manifest: &mut SnapshotManifest,
+    mode: HostCommandMode,
+) -> Result<(), PhaseBError> {
+    let xml_path = step
+        .touches
+        .first()
+        .cloned()
+        .ok_or_else(|| PhaseBError::Step {
+            step: StepKind::VmXmlGenerate,
+            detail: "vm-xml step has no declared touch path".to_string(),
+        })?;
+
+    // 1. Render the XML.
+    let xml_content =
+        crate::engine::generate_vm_xml(profile, &pending.config).map_err(|source| {
+            PhaseBError::XmlGenerate {
+                step: StepKind::VmXmlGenerate,
+                source,
+            }
+        })?;
+
+    // 2. Validate via virt-xml-validate when host commands are enabled.
+    if mode == HostCommandMode::Run {
+        crate::config::writers::commands::validate_xml(&xml_content).map_err(|source| {
+            PhaseBError::XmlValidate {
+                step: StepKind::VmXmlGenerate,
+                source,
+            }
+        })?;
+    }
+
+    // 3. Make sure the parent dir exists. ~/.virtu is created by Phase A
+    // (snapshots + pending live there) but the regular case does not
+    // include the XML file.
+    if let Some(parent) = xml_path.parent() {
+        filesystem
+            .create_dir_all(parent)
+            .map_err(|source| PhaseBError::io(parent, source))?;
+    }
+
+    // 4. Declare a manifest entry for the (likely-new) file before mutating.
+    // declare_created_entry is a no-op when the entry already exists.
+    let backup_relative = std::path::PathBuf::from(crate::snapshot::FILES_SUBDIR)
+        .join(crate::snapshot::sanitize_path(&xml_path));
+    crate::config::atomic_write::declare_created_entry(
+        manifest,
+        &xml_path,
+        &backup_relative,
+        StepKind::VmXmlGenerate,
+    );
+
+    // 5. Atomic write that records the post-edit hash on the manifest.
+    crate::config::atomic_write::snapshot_then_write(
+        manifest,
+        filesystem,
+        &xml_path,
+        xml_content.as_bytes(),
+    )
+    .map_err(|source| PhaseBError::Persist {
+        step: StepKind::VmXmlGenerate,
+        source,
+    })?;
+
+    // 6. Persist the updated manifest before moving on. If `virsh define`
+    // later fails, the rollback path needs to know the XML file exists.
+    write_manifest(filesystem, snapshots_root, &pending.snapshot_id, manifest)?;
+
+    Ok(())
+}
+
+/// Register the libvirt domain. Runs `qemu-img create` first if the user
+/// asked for a fresh image; otherwise refuses on a missing existing image.
+fn run_vm_register_step(
+    _step: &PlannedStep,
+    pending: &PendingPlan,
+    filesystem: &impl FileSystem,
+    snapshots_root: &Path,
+    manifest: &mut SnapshotManifest,
+    mode: HostCommandMode,
+) -> Result<(), PhaseBError> {
+    use crate::vm::DiskChoice;
+
+    // 1. Refuse early when the user pointed at a non-existent existing
+    // image. `virsh define` itself only checks the XML schema, not the
+    // referenced disks; we want a clean error before libvirt commits.
+    if let DiskChoice::Existing { path } = &pending.config.resources.disk {
+        if !filesystem.exists(path) {
+            return Err(PhaseBError::Step {
+                step: StepKind::VmRegister,
+                detail: format!(
+                    "configured existing disk image {} does not exist; refusing to register the domain",
+                    path.display()
+                ),
+            });
+        }
+    }
+
+    // 2. Locate the XML the previous step wrote. We take it from the
+    // manifest entry produced by VmXmlGenerate so the executor never
+    // hand-rebuilds the path.
+    let xml_path = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.produced_by == StepKind::VmXmlGenerate)
+        .map(|entry| entry.original_path.clone())
+        .ok_or_else(|| PhaseBError::Step {
+            step: StepKind::VmRegister,
+            detail: "manifest has no VmXmlGenerate entry; the prior step must have failed before persisting"
+                .to_string(),
+        })?;
+
+    let mut created_disk_path: Option<std::path::PathBuf> = None;
+
+    // 3. Create the disk image when requested. Only when host commands
+    // are enabled — Skip mode keeps the in-memory filesystem hermetic.
+    if let DiskChoice::Create {
+        path,
+        size_gb,
+        format,
+    } = &pending.config.resources.disk
+    {
+        let qemu_format = match format {
+            crate::vm::DiskFormat::Qcow2 => {
+                crate::config::writers::commands::DiskImageFormat::Qcow2
+            }
+            crate::vm::DiskFormat::Raw => crate::config::writers::commands::DiskImageFormat::Raw,
+        };
+
+        // Declare the disk image in the manifest before mutating, so a
+        // later rollback knows to delete it.
+        let backup_relative = std::path::PathBuf::from(crate::snapshot::FILES_SUBDIR)
+            .join(crate::snapshot::sanitize_path(path));
+        crate::config::atomic_write::declare_created_entry(
+            manifest,
+            path,
+            &backup_relative,
+            StepKind::VmRegister,
+        );
+        write_manifest(filesystem, snapshots_root, &pending.snapshot_id, manifest)?;
+
+        if mode == HostCommandMode::Run {
+            // Make sure the parent directory exists. `qemu-img create`
+            // refuses to create one for us. We use the live filesystem
+            // here so that even with `Run` we honor the FileSystem
+            // abstraction for the directory creation step.
+            if let Some(parent) = path.parent() {
+                filesystem
+                    .create_dir_all(parent)
+                    .map_err(|source| PhaseBError::io(parent, source))?;
+            }
+
+            crate::config::writers::commands::run_qemu_img_create(path, *size_gb, qemu_format)
+                .map_err(|source| PhaseBError::DiskCreate {
+                    step: StepKind::VmRegister,
+                    path: path.clone(),
+                    source,
+                })?;
+            created_disk_path = Some(path.clone());
+        }
+    }
+
+    // 4. Define the domain.
+    if mode == HostCommandMode::Run {
+        if let Err(source) = crate::config::writers::commands::run_virsh_define(&xml_path) {
+            // Compensating action: if we just created the disk image,
+            // remove it so a retry starts from a clean slate.
+            if let Some(disk) = created_disk_path.clone() {
+                if let Err(rm_err) = filesystem.remove_file(&disk) {
+                    tracing::warn!(
+                        ?rm_err,
+                        path = %disk.display(),
+                        "failed to clean up partial disk image after virsh define failure"
+                    );
+                }
+            }
+            return Err(PhaseBError::VirshDefine {
+                step: StepKind::VmRegister,
+                disk: created_disk_path,
+                source,
+            });
+        }
+
+        // 5. virsh define succeeded. Push the rollback action and persist
+        // the manifest so a subsequent `virtu rollback --to <id>` knows to
+        // run `virsh undefine <vm_name>`.
+        manifest.restore_actions.push(
+            crate::snapshot::manifest::RestoreAction::UndefineLibvirtDomain {
+                name: pending.config.vm_name.clone(),
+            },
+        );
+        write_manifest(filesystem, snapshots_root, &pending.snapshot_id, manifest)?;
+    }
+
+    Ok(())
 }
 
 fn run_verify_step(profile: &SystemProfile, pending: &PendingPlan) {
@@ -755,7 +1097,16 @@ mod phase_b_tests {
                 vm_name: "virtu-windows".to_string(),
                 guest_os: crate::vm::GuestOs::Windows11,
                 gpu_mode: crate::vm::GpuPassthroughMode::DualGpu,
-                gpu_roles: Vec::new(),
+                gpu_roles: vec![
+                    crate::vm::GpuRoleAssignment {
+                        pci_slot: "0000:01:00.0".to_string(),
+                        role: crate::vm::GpuRole::Passthrough,
+                    },
+                    crate::vm::GpuRoleAssignment {
+                        pci_slot: "0000:02:00.0".to_string(),
+                        role: crate::vm::GpuRole::Host,
+                    },
+                ],
                 monitor_plan: crate::vm::MonitorPlan::TwoMonitors {
                     host_connector: "DP-1".to_string(),
                     vm_connector: "DP-2".to_string(),
@@ -879,14 +1230,23 @@ mod phase_b_tests {
     #[test]
     fn phase_b_clears_pending_record_when_complete() {
         let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
         let state_root = PathBuf::from("/var/lib/virtu/state");
+        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
+        seed_test_manifest(&fs, &snapshots_root, &pending);
         fs.create_dir_all(&state_root).unwrap();
         let pending_path = state_root.join(crate::snapshot::pending::DEFAULT_FILENAME);
         fs.write_atomic(&pending_path, b"placeholder").unwrap();
 
-        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
-        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root)
-            .expect("phase B should succeed on a verify-only plan");
+        let outcome = execute_phase_b(
+            &pending,
+            &dummy_profile(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .expect("phase B should succeed on a verify-only plan");
 
         assert!(outcome.pending_cleared);
         assert!(outcome.completed_steps.contains(&StepKind::Verify));
@@ -894,42 +1254,81 @@ mod phase_b_tests {
     }
 
     #[test]
-    fn phase_b_records_unimplemented_step_kinds_as_deferred() {
+    fn phase_b_records_only_unimplemented_step_kinds_as_deferred() {
+        // After slice 7.6, VmXmlGenerate and VmRegister are no longer
+        // deferred — Phase B runs them. Only HookInstall (M9) and
+        // LookingGlassInstall (cut from v1.0) remain deferred.
         let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
         let state_root = PathBuf::from("/var/lib/virtu/state");
+        let mut pending = dummy_pending(vec![
+            dummy_step(StepKind::HookInstall),
+            dummy_step(StepKind::LookingGlassInstall),
+            vm_xml_step_with_touch(),
+            dummy_step(StepKind::VmRegister),
+            dummy_step(StepKind::Verify),
+        ]);
+        // The vm-xml step needs the parent dir to exist; the executor
+        // creates it but we still need a writable backing fs.
+        pending.config.vm_name = "virtu-test".to_string();
+        // Seed the existing disk image so VmRegister's pre-check passes
+        // against MemoryFileSystem.
+        let existing_disk = match &pending.config.resources.disk {
+            crate::vm::DiskChoice::Existing { path } => path.clone(),
+            _ => panic!("dummy_pending must use DiskChoice::Existing"),
+        };
+        if let Some(parent) = existing_disk.parent() {
+            fs.create_dir_all(parent).unwrap();
+        }
+        fs.write_atomic(&existing_disk, b"sentinel").unwrap();
+        seed_test_manifest(&fs, &snapshots_root, &pending);
         fs.create_dir_all(&state_root).unwrap();
         let pending_path = state_root.join(crate::snapshot::pending::DEFAULT_FILENAME);
         fs.write_atomic(&pending_path, b"placeholder").unwrap();
 
-        let pending = dummy_pending(vec![
-            dummy_step(StepKind::HookInstall),
-            dummy_step(StepKind::LookingGlassInstall),
-            dummy_step(StepKind::VmXmlGenerate),
-            dummy_step(StepKind::VmRegister),
-            dummy_step(StepKind::Verify),
-        ]);
-        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap();
+        let outcome = execute_phase_b(
+            &pending,
+            &dummy_profile_with_gpus(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap();
 
-        for kind in [
-            StepKind::HookInstall,
-            StepKind::LookingGlassInstall,
-            StepKind::VmXmlGenerate,
-            StepKind::VmRegister,
-        ] {
-            assert!(outcome.deferred_steps.contains(&kind));
-        }
+        // M9 / cut milestones are still deferred.
+        assert!(outcome.deferred_steps.contains(&StepKind::HookInstall));
+        assert!(outcome
+            .deferred_steps
+            .contains(&StepKind::LookingGlassInstall));
+
+        // VmXmlGenerate now runs to completion; VmRegister too in Skip
+        // mode (skips the host commands).
+        assert!(outcome.completed_steps.contains(&StepKind::VmXmlGenerate));
+        assert!(outcome.completed_steps.contains(&StepKind::VmRegister));
         assert!(outcome.completed_steps.contains(&StepKind::Verify));
+
         assert!(outcome.pending_cleared);
     }
 
     #[test]
     fn phase_b_refuses_phase_a_step_in_pending_list() {
         let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
         let state_root = PathBuf::from("/var/lib/virtu/state");
+        let pending = dummy_pending(vec![dummy_step(StepKind::BootloaderWrite)]);
+        seed_test_manifest(&fs, &snapshots_root, &pending);
         fs.create_dir_all(&state_root).unwrap();
 
-        let pending = dummy_pending(vec![dummy_step(StepKind::BootloaderWrite)]);
-        let err = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap_err();
+        let err = execute_phase_b(
+            &pending,
+            &dummy_profile(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap_err();
         match err {
             PhaseBError::Refused { detail } => {
                 assert!(detail.contains("BootloaderWrite"));
@@ -945,12 +1344,239 @@ mod phase_b_tests {
         // Phase B, the executor still walks the in-memory plan and reports
         // pending_cleared=false instead of erroring on a missing file.
         let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
         let state_root = PathBuf::from("/var/lib/virtu/state");
+        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
+        seed_test_manifest(&fs, &snapshots_root, &pending);
         fs.create_dir_all(&state_root).unwrap();
 
-        let pending = dummy_pending(vec![dummy_step(StepKind::Verify)]);
-        let outcome = execute_phase_b(&pending, &dummy_profile(), &fs, &state_root).unwrap();
+        let outcome = execute_phase_b(
+            &pending,
+            &dummy_profile(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap();
         assert!(!outcome.pending_cleared);
         assert!(outcome.completed_steps.contains(&StepKind::Verify));
+    }
+
+    #[test]
+    fn phase_b_writes_xml_under_dot_virtu_and_records_manifest_entry() {
+        // Slice 7.6 happy path against MemoryFileSystem in Skip mode:
+        // the XML lives at the planner-declared touch path, the manifest
+        // gains a VmXmlGenerate entry with a post-edit hash, and the
+        // domain XML actually generates from the user's PassthroughConfig.
+        let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        let mut pending = dummy_pending(vec![vm_xml_step_with_touch()]);
+        pending.config.vm_name = "virtu-test".to_string();
+        seed_test_manifest(&fs, &snapshots_root, &pending);
+        fs.create_dir_all(&state_root).unwrap();
+
+        let outcome = execute_phase_b(
+            &pending,
+            &dummy_profile_with_gpus(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .expect("vm-xml step should succeed in Skip mode");
+
+        assert!(outcome.completed_steps.contains(&StepKind::VmXmlGenerate));
+        let xml_path = PathBuf::from("/tmp/virtu-test.xml");
+        assert!(fs.exists(&xml_path), "Phase B must write the XML file");
+        let content = fs.read(&xml_path).unwrap();
+        let xml = String::from_utf8(content).unwrap();
+        assert!(xml.contains("<domain type='kvm'"));
+        assert!(xml.contains("<name>virtu-test</name>"));
+
+        let manifest_path = snapshots_root
+            .join(&pending.snapshot_id)
+            .join(crate::snapshot::MANIFEST_FILENAME);
+        let manifest_text = String::from_utf8(fs.read(&manifest_path).unwrap()).unwrap();
+        let manifest: SnapshotManifest = toml::from_str(&manifest_text).unwrap();
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.original_path == xml_path)
+            .expect("manifest must record the new XML file");
+        assert!(!entry.original_existed);
+        assert!(entry.post_edit_sha256.is_some());
+        assert_eq!(entry.produced_by, StepKind::VmXmlGenerate);
+    }
+
+    #[test]
+    fn phase_b_refuses_register_when_existing_disk_image_is_missing() {
+        // VmRegister with DiskChoice::Existing pointing at a path that
+        // does not exist must error out before any host command runs.
+        let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        let mut pending = dummy_pending(vec![
+            vm_xml_step_with_touch(),
+            dummy_step(StepKind::VmRegister),
+        ]);
+        pending.config.vm_name = "virtu-test".to_string();
+        pending.config.resources.disk = crate::vm::DiskChoice::Existing {
+            path: PathBuf::from("/var/lib/libvirt/images/missing.qcow2"),
+        };
+        seed_test_manifest(&fs, &snapshots_root, &pending);
+        fs.create_dir_all(&state_root).unwrap();
+
+        let err = execute_phase_b(
+            &pending,
+            &dummy_profile_with_gpus(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap_err();
+        match err {
+            PhaseBError::Step { step, detail } => {
+                assert_eq!(step, StepKind::VmRegister);
+                assert!(detail.contains("missing.qcow2"));
+            }
+            other => panic!("expected Step error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn phase_b_register_declares_disk_image_in_manifest_for_create_choice() {
+        // VmRegister with DiskChoice::Create declares the future disk
+        // image in the manifest *before* invoking qemu-img, so a partial
+        // run can be rolled back. In Skip mode, qemu-img is skipped but
+        // the manifest entry still lands and persists.
+        let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        let disk_path = PathBuf::from("/var/lib/libvirt/images/virtu-test.qcow2");
+        let mut pending = dummy_pending(vec![
+            vm_xml_step_with_touch(),
+            dummy_step(StepKind::VmRegister),
+        ]);
+        pending.config.vm_name = "virtu-test".to_string();
+        pending.config.resources.disk = crate::vm::DiskChoice::Create {
+            path: disk_path.clone(),
+            size_gb: 100,
+            format: crate::vm::DiskFormat::Qcow2,
+        };
+        seed_test_manifest(&fs, &snapshots_root, &pending);
+        fs.create_dir_all(&state_root).unwrap();
+
+        let outcome = execute_phase_b(
+            &pending,
+            &dummy_profile_with_gpus(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap();
+        assert!(outcome.completed_steps.contains(&StepKind::VmRegister));
+
+        let manifest_path = snapshots_root
+            .join(&pending.snapshot_id)
+            .join(crate::snapshot::MANIFEST_FILENAME);
+        let manifest_text = String::from_utf8(fs.read(&manifest_path).unwrap()).unwrap();
+        let manifest: SnapshotManifest = toml::from_str(&manifest_text).unwrap();
+        let disk_entry = manifest
+            .entries
+            .iter()
+            .find(|e| e.original_path == disk_path)
+            .expect("manifest must record the planned disk image");
+        assert_eq!(disk_entry.produced_by, StepKind::VmRegister);
+        assert!(!disk_entry.original_existed);
+
+        // In Skip mode no virsh define ran, so no UndefineLibvirtDomain
+        // restore action should have been pushed.
+        assert!(!manifest.restore_actions.iter().any(|a| matches!(
+            a,
+            crate::snapshot::RestoreAction::UndefineLibvirtDomain { .. }
+        )));
+    }
+
+    /// Build a minimal in-memory snapshot manifest for the snapshot id
+    /// the dummy pending plan uses, and persist it to the test
+    /// MemoryFileSystem under `<snapshots_root>/<id>/manifest.toml`.
+    fn seed_test_manifest(fs: &MemoryFileSystem, snapshots_root: &Path, pending: &PendingPlan) {
+        let snapshot_dir = snapshots_root.join(&pending.snapshot_id);
+        fs.create_dir_all(&snapshot_dir.join(crate::snapshot::FILES_SUBDIR))
+            .unwrap();
+        let manifest = SnapshotManifest::new(
+            &pending.snapshot_id,
+            crate::snapshot::manifest::HostSummary {
+                distro_id: "arch".to_string(),
+                distro_pretty_name: "Arch".to_string(),
+                kernel_version: "6.10.0".to_string(),
+                bootloader: crate::detect::bootloader::BootloaderKind::Grub2,
+                initramfs: crate::detect::initramfs::InitramfsSystem::Mkinitcpio,
+            },
+            pending.plan_summary.clone(),
+            Vec::new(),
+        );
+        let serialized = toml::to_string(&manifest).unwrap();
+        let manifest_path = snapshot_dir.join(crate::snapshot::MANIFEST_FILENAME);
+        fs.write_atomic(&manifest_path, serialized.as_bytes())
+            .unwrap();
+    }
+
+    /// A `VmXmlGenerate` step with a writable touch path the
+    /// MemoryFileSystem can host.
+    fn vm_xml_step_with_touch() -> PlannedStep {
+        let mut step = dummy_step(StepKind::VmXmlGenerate);
+        step.touches = vec![PathBuf::from("/tmp/virtu-test.xml")];
+        step
+    }
+
+    /// Profile with two GPUs so `vm_view` succeeds for the dummy config
+    /// (DualGpu mode + the role assignments below).
+    fn dummy_profile_with_gpus() -> SystemProfile {
+        use crate::detect::gpu::{GpuInfo, GpuType, GpuVendor};
+        let mut profile = dummy_profile();
+        profile.gpus = vec![
+            GpuInfo {
+                pci_slot: "0000:01:00.0".to_string(),
+                vendor: GpuVendor::Amd,
+                gpu_type: GpuType::Discrete,
+                model_name: "Test AMD".to_string(),
+                vendor_id: "1002".to_string(),
+                device_id: "7590".to_string(),
+                subsystem_vendor_id: "0000".to_string(),
+                subsystem_device_id: "0000".to_string(),
+                current_driver: None,
+                iommu_group_id: Some(1),
+                iommu_isolated: true,
+                rom_accessible: false,
+                companion_audio: None,
+                is_boot_vga: false,
+                vfio_compatible: true,
+                quirks: Vec::new(),
+            },
+            GpuInfo {
+                pci_slot: "0000:02:00.0".to_string(),
+                vendor: GpuVendor::Nvidia,
+                gpu_type: GpuType::Discrete,
+                model_name: "Test NVIDIA".to_string(),
+                vendor_id: "10de".to_string(),
+                device_id: "1f08".to_string(),
+                subsystem_vendor_id: "0000".to_string(),
+                subsystem_device_id: "0000".to_string(),
+                current_driver: None,
+                iommu_group_id: Some(2),
+                iommu_isolated: true,
+                rom_accessible: false,
+                companion_audio: None,
+                is_boot_vga: false,
+                vfio_compatible: true,
+                quirks: Vec::new(),
+            },
+        ];
+        profile
     }
 }

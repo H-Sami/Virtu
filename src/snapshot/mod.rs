@@ -255,6 +255,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Convert a plan into the post-restore commands a user must re-run after
 /// rollback. The mapping is intentionally small; later milestones can add
 /// step-kind-specific actions as new writers are wired up.
+///
+/// Note: `RestoreAction::UndefineLibvirtDomain` is *not* derived from the
+/// plan here. Phase B appends it to the manifest only after `virsh define`
+/// succeeds, so a rollback before registration does not falsely tell the
+/// user to run `virsh undefine` against a domain that was never created.
 fn derive_restore_actions(plan: &Plan, host: &SystemProfile) -> Vec<RestoreAction> {
     let mut actions: Vec<RestoreAction> = Vec::new();
 
@@ -278,11 +283,9 @@ fn derive_restore_actions(plan: &Plan, host: &SystemProfile) -> Vec<RestoreActio
                     module: "vfio_pci".to_string(),
                 });
             }
-            StepKind::VmRegister => {
-                actions.push(RestoreAction::UndefineLibvirtDomain {
-                    name: "<generated>".to_string(),
-                });
-            }
+            // VmRegister intentionally has no upfront restore action. The
+            // executor adds `UndefineLibvirtDomain { name: vm_name }` after
+            // a successful `virsh define`.
             _ => {}
         }
     }

@@ -108,6 +108,7 @@ async fn run_apply(phase: ApplyPhase, confirm: bool) -> Result<()> {
 
 async fn run_resume() -> Result<()> {
     let virtu_home = dirs_home().join(".virtu");
+    let snapshots_root = virtu_home.join("snapshots");
     let state_root = virtu_home.join("state");
     let pending_path = state_root.join(snapshot::pending::DEFAULT_FILENAME);
 
@@ -163,8 +164,15 @@ async fn run_resume() -> Result<()> {
     }
 
     let filesystem = snapshot::RealFileSystem::new();
-    let outcome = engine::execute_phase_b(&pending, &profile, &filesystem, &state_root)
-        .map_err(|err| anyhow::anyhow!("Phase B failed: {err}"))?;
+    let outcome = engine::execute_phase_b(
+        &pending,
+        &profile,
+        &filesystem,
+        &snapshots_root,
+        &state_root,
+        engine::HostCommandMode::Run,
+    )
+    .map_err(|err| anyhow::anyhow!("Phase B failed: {err}"))?;
 
     println!("\n=== PHASE B SUMMARY ===");
     if !outcome.completed_steps.is_empty() {

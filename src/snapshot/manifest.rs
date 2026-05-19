@@ -123,7 +123,9 @@ pub enum RestoreAction {
     /// reboot. Optional: skipping it just means the user must reboot.
     ReloadKernelModules { module: String },
     /// Undefine a libvirt domain that was created by the plan. The argument
-    /// is the domain name (or `<generated>` until vm_name lands in Phase 7).
+    /// is the libvirt domain name (`PassthroughConfig::vm_name`). Phase B
+    /// appends this restore action to the manifest only after `virsh
+    /// define` succeeds.
     UndefineLibvirtDomain { name: String },
     /// Inform the user that the host must reboot for the rollback to be
     /// fully effective. Carries no command because reboots cannot be
