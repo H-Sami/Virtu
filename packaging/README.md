@@ -37,7 +37,7 @@ rpmdev-setuptree
 tar -czf ~/rpmbuild/SOURCES/virtu-0.1.0.tar.gz \
     --transform 's,^,virtu-0.1.0/,' \
     -C ../../ \
-    Cargo.toml Cargo.lock src tests packaging/share README.md
+    Cargo.toml Cargo.lock src tests packaging/share README.md LICENSE
 cp virtu.spec ~/rpmbuild/SPECS/
 rpmbuild -ba ~/rpmbuild/SPECS/virtu.spec
 sudo dnf install ~/rpmbuild/RPMS/x86_64/virtu-*.rpm   # Fedora

@@ -102,28 +102,9 @@ package() {
         "${pkgdir}/usr/share/man/man1/virtu.1"
     gzip -9 "${pkgdir}/usr/share/man/man1/virtu.1"
 
-    # MIT license file. Cargo.toml declares license = "MIT" but the
-    # repo doesn't yet ship a top-level LICENSE; the README cites
-    # the same MIT text. Installing a placeholder text file is wrong
-    # — instead, fail loudly here if the file is missing so a future
-    # commit that adds LICENSE wires it in automatically.
-    if [[ -f "${srcdir}/virtu-source/LICENSE" ]]; then
-        install -Dm644 \
-            "${srcdir}/virtu-source/LICENSE" \
-            "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-    else
-        # No top-level LICENSE yet. Generate a stub that points at the
-        # Cargo.toml license declaration and the upstream repo. When
-        # the LICENSE file lands upstream this branch becomes dead
-        # code automatically.
-        install -dm755 "${pkgdir}/usr/share/licenses/${pkgname}"
-        cat > "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" <<'EOF'
-Virtu is licensed under the MIT License. See:
-  https://github.com/H-Sami/Virtu
-
-The full MIT license text is the standard MIT license. Cargo.toml
-declares `license = "MIT"`. A top-level LICENSE file will be added
-in a future release; until then this notice serves as the redirect.
-EOF
-    fi
+    # MIT license file. The repo ships a top-level LICENSE; install it
+    # to the canonical Arch licenses dir.
+    install -Dm644 \
+        "${srcdir}/virtu-source/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }
