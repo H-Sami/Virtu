@@ -1,0 +1,123 @@
+.TH VIRTU 1 "2026-05-19" "virtu 0.1.0" "User Commands"
+.SH NAME
+virtu \- GPU passthrough automation for Linux
+.SH SYNOPSIS
+.B virtu
+[\fISUBCOMMAND\fR] [\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B virtu
+is a local-first Rust tool that detects a Linux host's hardware and
+software configuration, explains the viable GPU passthrough paths,
+generates a verified plan, snapshots every file it may touch, applies
+changes atomically with rollback support, and registers a libvirt
+domain.
+
+The tool is designed around the principle of honest refusal: rather than
+claim to "fix any PC", it explains exactly what is and isn't possible
+on the detected host, and only mutates state through a snapshot manifest
+that can be replayed in reverse.
+.PP
+.B virtu
+never sends data to remote services, requires no account, and runs
+entirely from local data. The bundled knowledge base of GPU quirks and
+distro paths is compiled into the binary at build time.
+.SH SUBCOMMANDS
+.TP
+.B wizard
+Launch the interactive TUI wizard (default when no subcommand is given).
+The wizard walks through detection, choice configuration, plan preview,
+and confirmation.
+.TP
+.B scan
+Print a read-only summary of the detected host and the
+\fIcompatibility report\fR (each finding is rated PASS / WARN / FAIL).
+Mutates nothing.
+.TP
+.B plan
+Build a dry-run plan from the detected state and the recommended
+defaults. Each step in the plan declares the files it touches, the
+commands it would run, the verification it expects, and the rollback
+path. Mutates nothing.
+.TP
+\fBapply\fR \fB\-\-phase\fR \fIa\fR [\fB\-\-confirm\fR]
+Apply Phase A of the plan: capture a snapshot, edit the bootloader's
+kernel command line, write the VFIO modprobe snippet, and rebuild the
+initramfs. Without \fB\-\-confirm\fR the command prints what
+\fIwould\fR happen but does not write anything.
+
+After Phase A finishes the host must be rebooted into the new kernel
+before
+.B virtu resume
+can complete the post-reboot work.
+.TP
+.B resume
+Continue an apply after the host has rebooted. Reads the pending-plan
+record persisted by Phase A, verifies that the IOMMU is now active and
+the passthrough GPU is bound to vfio-pci, and then runs the remaining
+post-reboot steps (VM XML generation, libvirt registration, single-GPU
+hooks when applicable).
+.TP
+\fBrollback\fR [\fB\-\-list\fR] [\fB\-\-to\fR \fISNAPSHOT_ID\fR]
+Without flags, prints help. With \fB\-\-list\fR, lists every snapshot
+under \fI~/.virtu/snapshots/\fR with its timestamp and a summary of
+the steps it covers. With \fB\-\-to \fISNAPSHOT_ID\fR, restores every
+file the named snapshot recorded back to its pre-edit bytes and runs
+any compensating actions (\fIvirsh undefine\fR, hook script removal,
+etc.).
+.TP
+.B status
+Print the live VFIO and IOMMU state of the host plus a one-line
+\fI[NOTE]\fR banner if there is a pending Phase-A apply waiting for
+.BR resume .
+.SH FILES
+.TP
+.I ~/.virtu/snapshots/<id>/manifest.toml
+Snapshot manifest. Records every backed-up path, its pre-edit and
+post-edit SHA-256 hashes, the originating step, and the rollback
+actions that should run when the snapshot is restored.
+.TP
+.I ~/.virtu/state/pending.toml
+Pending-plan record. Written by Phase A; read by
+.BR resume .
+Existence of this file blocks a fresh
+.B virtu apply
+to prevent overlapping in-flight applies.
+.TP
+.I ~/.virtu/logs/<timestamp>.log
+Per-invocation log. Captures every step the tool ran, including the
+exact commands and their exit codes.
+.SH SAFETY MODEL
+.B virtu
+treats every host change as reversible. It refuses to:
+.IP \(bu 2
+mutate any file without first capturing it in a snapshot manifest;
+.IP \(bu 2
+run as root \fI(use targeted sudo for individual commands instead)\fR;
+.IP \(bu 2
+write a hook script that has not first passed
+.BR "bash \-n" ;
+.IP \(bu 2
+register a libvirt domain whose XML has not first passed
+.BR virt\-xml\-validate (1).
+.PP
+Risky paths \(em single-GPU hooks, ACS override, anything that could
+leave the host without a usable display \(em require explicit user
+confirmation in the wizard or via
+.BR "\-\-confirm" .
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+A documented failure mode (compatibility blocker, validation error,
+host divergence, missing pending plan). The accompanying message
+explains the cause and points at the rollback id when applicable.
+.SH SEE ALSO
+.BR libvirt (8),
+.BR qemu\-system\-x86_64 (1),
+.BR virt\-install (1),
+.BR virsh (1),
+.BR virt\-xml\-validate (1)
+.SH AUTHORS
+Virtu Contributors. Source: <https://github.com/H-Sami/Virtu>

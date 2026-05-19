@@ -1,0 +1,129 @@
+# Maintainer: Virtu Contributors <https://github.com/H-Sami/Virtu>
+# shellcheck disable=SC2034,SC2148
+#
+# Arch Linux PKGBUILD for Virtu (Milestone 10, slice 10.5).
+#
+# Virtu is a single Rust binary plus a bundled knowledge-base TOML
+# (compiled in via include_str!), so the build path is plain
+# `cargo build --release`. There is nothing distro-specific to patch.
+#
+# Build with:
+#   cd packaging/arch
+#   makepkg --syncdeps --rmdeps --clean
+#   sudo pacman -U virtu-*.pkg.tar.zst
+
+pkgname=virtu
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local-first Linux GPU passthrough automation tool"
+arch=('x86_64')
+url="https://github.com/H-Sami/Virtu"
+license=('MIT')
+
+# Runtime dependencies. Virtu is a small static-ish Rust binary; the
+# packages below are what its CLI shells out to at apply / resume time.
+# Each is gated by a runtime check (Virtu degrades gracefully when an
+# optional command is missing), so users with a custom QEMU build can
+# remove individual deps if they know what they're doing.
+depends=(
+    'qemu-base'         # qemu-system-x86_64, qemu-img
+    'libvirt'           # virsh, libvirtd
+    'edk2-ovmf'         # OVMF firmware for UEFI guests
+    'bash'              # validate_bash_script + the generated single-GPU hook scripts
+)
+
+# Optional dependencies: nice-to-have, never blocking. The compatibility
+# report surfaces missing optional tools as PASS-with-note instead of
+# FAIL.
+optdepends=(
+    'libvirt-glib: integration with virt-manager'
+    'virt-manager: graphical libvirt front-end'
+    'dnsmasq: NAT networking for the default libvirt network'
+    'iptables-nft: firewall rules for the default libvirt network'
+    'mkinitcpio: initramfs builder used on Arch by default'
+    'dracut: alternative initramfs builder'
+)
+
+# Build dependencies.
+makedepends=(
+    'rust'
+    'cargo'
+    'gzip'              # for the man-page install
+)
+
+# `${startdir}` points at packaging/arch when the user runs
+# `makepkg` from there, so the source tree is two parents up. We
+# stage it into the build dir via the local-path source so makepkg's
+# normal extract / build flow still applies.
+source=(
+    "virtu-source::git+file://${startdir}/../.."
+)
+sha256sums=(
+    'SKIP'
+)
+
+prepare() {
+    cd "${srcdir}/virtu-source"
+    # Pin against the lockfile in the source tree. `--frozen` would
+    # also work, but `--locked` produces a clearer error if a
+    # contributor forgot to commit a Cargo.lock update.
+    cargo fetch --locked
+}
+
+build() {
+    cd "${srcdir}/virtu-source"
+    # CARGO_TARGET_DIR keeps `target/` inside makepkg's $srcdir so a
+    # second `makepkg` from the same checkout doesn't reuse stale
+    # artefacts.
+    export CARGO_TARGET_DIR="${srcdir}/target"
+    cargo build --release --locked --bin virtu
+}
+
+check() {
+    cd "${srcdir}/virtu-source"
+    export CARGO_TARGET_DIR="${srcdir}/target"
+    # The full suite is hermetic (MemoryFileSystem + fixture roots).
+    # No real-host commands run, so this is safe inside makepkg's
+    # sandboxed build.
+    cargo test --release --locked
+}
+
+package() {
+    cd "${srcdir}/virtu-source"
+
+    # Binary.
+    install -Dm755 \
+        "${srcdir}/target/release/virtu" \
+        "${pkgdir}/usr/bin/virtu"
+
+    # Man page (gzipped per Arch packaging guidelines).
+    install -Dm644 \
+        "${srcdir}/virtu-source/packaging/share/man/virtu.1" \
+        "${pkgdir}/usr/share/man/man1/virtu.1"
+    gzip -9 "${pkgdir}/usr/share/man/man1/virtu.1"
+
+    # MIT license file. Cargo.toml declares license = "MIT" but the
+    # repo doesn't yet ship a top-level LICENSE; the README cites
+    # the same MIT text. Installing a placeholder text file is wrong
+    # — instead, fail loudly here if the file is missing so a future
+    # commit that adds LICENSE wires it in automatically.
+    if [[ -f "${srcdir}/virtu-source/LICENSE" ]]; then
+        install -Dm644 \
+            "${srcdir}/virtu-source/LICENSE" \
+            "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    else
+        # No top-level LICENSE yet. Generate a stub that points at the
+        # Cargo.toml license declaration and the upstream repo. When
+        # the LICENSE file lands upstream this branch becomes dead
+        # code automatically.
+        install -dm755 "${pkgdir}/usr/share/licenses/${pkgname}"
+        cat > "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" <<'EOF'
+Virtu is licensed under the MIT License. See:
+  https://github.com/H-Sami/Virtu
+
+The full MIT license text is the standard MIT license. Cargo.toml
+declares `license = "MIT"`. A top-level LICENSE file will be added
+in a future release; until then this notice serves as the redirect.
+EOF
+    fi
+}
