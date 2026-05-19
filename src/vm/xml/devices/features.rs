@@ -36,3 +36,64 @@ pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
     writeln!(xml, "  </features>")?;
     Ok(xml)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use crate::vm::profile::vm_view;
+    use crate::vm::xml::devices::fixtures::{
+        amd_host_with_amd_passthrough, nvidia_passthrough_profile,
+        windows_dual_gpu_config_amd_passthrough, windows_dual_gpu_config_nvidia_passthrough,
+    };
+
+    /// Default Windows-on-AMD: ACPI + APIC + Hyper-V enlightenments,
+    /// no `<kvm><hidden state='on'/></kvm>` block (AMD does not need
+    /// the NVIDIA Code-43 workaround).
+    #[test]
+    fn features_renderer_amd_emits_full_hyperv_block_no_kvm_hidden() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render(&view).expect("render");
+        assert!(xml.starts_with("  <features>\n"));
+        assert!(xml.contains("<acpi/>"));
+        assert!(xml.contains("<apic/>"));
+        assert!(xml.contains("<hyperv mode='custom'>"));
+        assert!(xml.contains("<vapic state='on'/>"));
+        assert!(xml.contains("<spinlocks state='on' retries='8191'/>"));
+        assert!(xml.contains("<ipi state='on'/>"));
+        assert!(xml.contains("<ioapic driver='kvm'/>"));
+        assert!(!xml.contains("<kvm>"));
+        assert!(xml.trim_end().ends_with("</features>"));
+    }
+
+    /// NVIDIA passthrough requires the `<kvm><hidden state='on'/></kvm>`
+    /// block so the GeForce driver does not detect the hypervisor and
+    /// refuse to load with Code 43.
+    #[test]
+    fn features_renderer_nvidia_emits_kvm_hidden_block() {
+        let profile = nvidia_passthrough_profile();
+        let config = windows_dual_gpu_config_nvidia_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render(&view).expect("render");
+        assert!(xml.contains("<kvm>"));
+        assert!(xml.contains("<hidden state='on'/>"));
+    }
+
+    /// When Hyper-V is disabled (e.g. Linux guests), the entire
+    /// `<hyperv>` block disappears. We pin its absence so a future
+    /// renderer change cannot silently re-enable it.
+    #[test]
+    fn features_renderer_omits_hyperv_block_for_non_hyperv_guests() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let mut view = vm_view(&profile, &config).expect("view");
+        view.enable_hyperv = false;
+
+        let xml = render(&view).expect("render");
+        assert!(!xml.contains("<hyperv"));
+        assert!(!xml.contains("<ioapic driver='kvm'/>"));
+    }
+}

@@ -106,3 +106,74 @@ fn write_cpu_tune(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+    use crate::vm::profile::vm_view;
+    use crate::vm::xml::devices::fixtures::{
+        amd_host_with_amd_passthrough, nvidia_passthrough_profile,
+        windows_dual_gpu_config_amd_passthrough, windows_dual_gpu_config_nvidia_passthrough,
+    };
+
+    /// Default Windows-on-AMD-passthrough emits host-passthrough mode,
+    /// 1 socket / 2 cores / 2 threads (4 vCPUs split across HT pairs),
+    /// `topoext` (AMD requires it), the Hyper-V clock timer, and a
+    /// utc clock offset because the guest is Windows-11.
+    #[test]
+    fn cpu_renderer_amd_default_emits_pinning_and_topoext_and_hyperv_clock() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render(&view, &profile).expect("render");
+
+        assert!(xml.contains("<cpu mode='host-passthrough' check='none' migratable='off'>"));
+        assert!(xml.contains("<topology sockets='1' dies='1' cores='2' threads='2'/>"));
+        assert!(xml.contains("<cache mode='passthrough'/>"));
+        assert!(xml.contains("<feature policy='require' name='topoext'/>"));
+        assert!(xml.contains("<vcpu placement='static'>4</vcpu>"));
+
+        // Windows benefits from Hyper-V → localtime + hypervclock timer.
+        assert!(xml.contains("<clock offset='localtime'>"));
+        assert!(xml.contains("<timer name='hpet' present='no'/>"));
+        assert!(xml.contains("<timer name='hypervclock' present='yes'/>"));
+
+        // Pinning + emulator pin + iothread pin are present.
+        assert!(xml.contains("<cputune>"));
+        assert!(xml.contains("<vcpupin"));
+        assert!(xml.contains("<emulatorpin"));
+        assert!(xml.contains("<iothreadpin iothread='1'"));
+        assert!(xml.contains("<iothreads>1</iothreads>"));
+    }
+
+    /// NVIDIA passthrough with Hyper-V enabled: the Hyper-V vendor-id
+    /// spoof block ships so the NVIDIA driver does not detect the
+    /// hypervisor and refuse to load (Code 43). This is the GeForce
+    /// driver's well-known anti-virtualization check.
+    #[test]
+    fn cpu_renderer_nvidia_passthrough_includes_hyperv_vendor_id_spoof() {
+        let profile = nvidia_passthrough_profile();
+        let config = windows_dual_gpu_config_nvidia_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render(&view, &profile).expect("render");
+        assert!(xml.contains("<vendor_id state='on' value='AuthenticAMD'/>"));
+    }
+
+    /// `use_cpu_pinning = false` removes the entire `<cputune>` and
+    /// `<iothreads>` blocks. We pin both so a future change cannot
+    /// silently land vCPU pinning when the user opted out.
+    #[test]
+    fn cpu_renderer_omits_cputune_when_pinning_disabled() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let mut view = vm_view(&profile, &config).expect("view");
+        view.use_cpu_pinning = false;
+
+        let xml = render(&view, &profile).expect("render");
+        assert!(!xml.contains("<cputune>"));
+        assert!(!xml.contains("<iothreads>"));
+        assert!(!xml.contains("<vcpupin"));
+    }
+}
