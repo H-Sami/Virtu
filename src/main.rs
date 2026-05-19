@@ -6,13 +6,43 @@ use virtu::cli::{ApplyPhase, Cli, Commands};
 use virtu::{detect, engine, snapshot, tui};
 
 fn setup_logging() -> Result<()> {
-    let log_dir = dirs_home().join(".virtu").join("logs");
-    std::fs::create_dir_all(&log_dir)?;
+    // Try the user's `~/.virtu/logs/` first. If `$HOME` is not
+    // writable (some sudo configs clear it; CI sandboxes set it to a
+    // read-only path), fall back to `/tmp/virtu/logs/` so even
+    // `virtu --help` still produces useful output. We never abort
+    // the binary on logging-init failure; logging is supportive, not
+    // load-bearing.
+    let primary_dir = dirs_home().join(".virtu").join("logs");
+    let fallback_dir = std::env::temp_dir().join("virtu").join("logs");
+
+    let log_dir = match std::fs::create_dir_all(&primary_dir) {
+        Ok(()) => primary_dir,
+        Err(primary_err) => match std::fs::create_dir_all(&fallback_dir) {
+            Ok(()) => {
+                eprintln!(
+                    "warning: could not create log dir at {}: {primary_err}; \
+                     falling back to {}",
+                    dirs_home().join(".virtu").join("logs").display(),
+                    fallback_dir.display(),
+                );
+                fallback_dir
+            }
+            Err(fallback_err) => {
+                eprintln!(
+                    "warning: could not create either {} ({primary_err}) or {} ({fallback_err}); \
+                     continuing without file logging",
+                    primary_dir.display(),
+                    fallback_dir.display(),
+                );
+                return Ok(());
+            }
+        },
+    };
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
     let log_file = log_dir.join(format!("{timestamp}.log"));
 
-    let file_appender = tracing_appender::rolling::never(log_dir, format!("{timestamp}.log"));
+    let file_appender = tracing_appender::rolling::never(&log_dir, format!("{timestamp}.log"));
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
@@ -33,11 +63,30 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the user's home directory. Falls back to `/tmp` if neither
+/// `HOME` (Unix) nor `USERPROFILE` (Windows) is set. The fallback is
+/// volatile across reboots, so we surface that fact to stderr the
+/// first time it is taken; otherwise a user with a misconfigured shell
+/// could silently end up with snapshots that vanish on reboot. The
+/// warning is rate-limited via a one-shot guard so a single invocation
+/// does not produce N copies.
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        return PathBuf::from(home);
+    }
+
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: neither HOME nor USERPROFILE is set; \
+             falling back to /tmp for Virtu state. \
+             Snapshots stored under /tmp/.virtu/ may not survive a reboot. \
+             Set HOME to your user account to keep snapshots durable."
+        );
+    }
+    PathBuf::from("/tmp")
 }
 
 async fn run_apply(phase: ApplyPhase, confirm: bool) -> Result<()> {
