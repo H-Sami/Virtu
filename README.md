@@ -2,7 +2,7 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, and the post-reboot `virtu resume` path are all in place. The libvirt domain XML refactor and registration step (the rest of Milestone 7) is in progress, then single-GPU passthrough hooks (Milestone 9) and the diagnostics/packaging polish (Milestone 10) round out the v1.0 target.
+This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, the post-reboot `virtu resume` path, the libvirt domain XML refactor + registration step (Milestone 7), and most of the single-GPU passthrough hook work (Milestone 9 slices 9.1 - 9.4) are all in place. The single-GPU integration test (Milestone 9 slice 9.5) and the diagnostics/packaging polish (Milestone 10) round out the v1.0 target.
 
 Looking Glass is explicitly out of scope for v1.0. The data model and validation still understand `LookingGlassChoice` for forward compatibility, but no installer or auto-build path will ship. Users who want Looking Glass can install the client manually after Virtu finishes.
 
@@ -34,7 +34,7 @@ Virtu must never silently change a system. The implementation follows this order
 5. Verify the expected state.
 6. Diagnose or roll back on failure.
 
-The `plan` command exposes step 2 in full: every step declares its risk, privilege need, touched files, commands, verification description, rollback description, reboot requirement, and explicit-confirmation flag. Step 3 is implemented via `Snapshot::capture` (manifest-backed under `~/.virtu/snapshots/<id>/`). Step 4 is implemented via `apply --phase a --confirm` (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild, with host-command regenerate). Step 5 is implemented via `virtu resume`, which re-detects the post-reboot host, verifies that IOMMU is active, vfio-pci is bound to the requested PCI ids, and the kernel cmdline carries the expected parameters; on `Ready` it finishes any remaining steps, on `NotReady` or `WrongHost` it lists the divergences and points at rollback. Step 6 is implemented via `rollback --to <id>`.
+The `plan` command exposes step 2 in full: every step declares its risk, privilege need, touched files, commands, verification description, rollback description, reboot requirement, and explicit-confirmation flag. Step 3 is implemented via `Snapshot::capture` (manifest-backed under `~/.virtu/snapshots/<id>/`). Step 4 is implemented via `apply --phase a --confirm` (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild, with host-command regenerate). Step 5 is implemented via `virtu resume`, which re-detects the post-reboot host, verifies that IOMMU is active, vfio-pci is bound to the requested PCI ids, and the kernel cmdline carries the expected parameters; on `Ready` it generates the libvirt domain XML, runs `virt-xml-validate`, writes the XML through the snapshot manifest, creates the disk image with `qemu-img create` if needed, registers the domain with `virsh define`, and (for single-GPU plans) installs syntax-checked libvirt hook scripts under `/etc/libvirt/hooks/qemu.d/<vm>/`. On `NotReady` or `WrongHost` it lists the divergences and points at rollback. Step 6 is implemented via `rollback --to <id>`.
 
 GPU passthrough requires a host reboot to apply bootloader, initramfs, and module-load changes. Virtu handles this with a resumable two-phase model: Phase A (snapshot, bootloader edit, VFIO modprobe, initramfs rebuild) runs before the reboot and persists a `PendingPlan` record; the user reboots manually; Phase B (`virtu resume`) verifies the post-reboot state and finishes the workflow.
 
@@ -44,7 +44,7 @@ The first production-quality slice should support:
 
 - Arch, Fedora, Debian/Ubuntu, and openSUSE families.
 - GRUB2 and systemd-boot first, then rEFInd, Syslinux/Extlinux, and EFISTUB.
-- Dual GPU and iGPU-host setups before single-GPU hooks; single-GPU hooks land in Milestone 9 once rollback and dual-GPU automation are proven.
+- Dual GPU and iGPU-host setups before single-GPU hooks; single-GPU hooks land in Milestone 9 alongside `bash -n` validation, a hook installer wired into Phase B, and a manifest-backed verifier so rollback knows exactly what to clean up.
 - User-selected VM OS, ISO, RAM, CPU count, storage, monitor plan, and keyboard/mouse passthrough.
 
 Looking Glass is excluded from v1.0; users who want it integrate it manually after Virtu defines the VM.
