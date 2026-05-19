@@ -10,3 +10,9 @@
 /virtu_development_plan.md
 /script.sh
 /docs/
+
+# Real-hardware test runs are local artifacts, not source-of-truth
+# data. They land under tests/results/<timestamp>/ via the runner
+# script and may include host-specific paths, kernel cmdlines, and
+# libvirt domain names that shouldn't be committed.
+/tests/results/
