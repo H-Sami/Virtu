@@ -156,26 +156,11 @@ pub fn execute_phase_a(
                 completed.push(StepKind::BootloaderWrite);
             }
             StepKind::VfioConfig => {
-                run_vfio_step(
-                    step,
-                    host,
-                    config,
-                    filesystem,
-                    &mut manifest,
-                    snapshots_root,
-                    &snapshot_id,
-                )?;
+                run_vfio_step(step, host, config, filesystem, &mut manifest)?;
                 completed.push(StepKind::VfioConfig);
             }
             StepKind::InitramfsWrite => {
-                run_initramfs_step(
-                    step,
-                    host,
-                    filesystem,
-                    &mut manifest,
-                    snapshots_root,
-                    &snapshot_id,
-                )?;
+                run_initramfs_step(step, host, filesystem, &mut manifest)?;
                 completed.push(StepKind::InitramfsWrite);
             }
             // Phase B steps are skipped here. They are recorded in the
@@ -278,8 +263,6 @@ fn run_vfio_step(
     config: &PassthroughConfig,
     filesystem: &impl FileSystem,
     manifest: &mut SnapshotManifest,
-    snapshots_root: &Path,
-    snapshot_id: &str,
 ) -> Result<(), PhaseAError> {
     let target = step.touches.first().ok_or_else(|| PhaseAError::Plan {
         step: StepKind::VfioConfig,
@@ -303,8 +286,6 @@ fn run_vfio_step(
     // no-op when the entry already exists, so this is safe to call.
     let backup_relative =
         PathBuf::from(crate::snapshot::FILES_SUBDIR).join(crate::snapshot::sanitize_path(target));
-    let _ = snapshots_root;
-    let _ = snapshot_id;
     declare_created_entry(manifest, target, &backup_relative, StepKind::VfioConfig);
 
     snapshot_then_write(manifest, filesystem, target, new_content.as_bytes())?;
@@ -316,8 +297,6 @@ fn run_initramfs_step(
     host: &SystemProfile,
     filesystem: &impl FileSystem,
     manifest: &mut SnapshotManifest,
-    snapshots_root: &Path,
-    snapshot_id: &str,
 ) -> Result<(), PhaseAError> {
     let target = step.touches.first().ok_or_else(|| PhaseAError::Plan {
         step: StepKind::InitramfsWrite,
@@ -361,8 +340,6 @@ fn run_initramfs_step(
             .join(crate::snapshot::sanitize_path(target));
         declare_created_entry(manifest, target, &backup_relative, StepKind::InitramfsWrite);
     }
-    let _ = snapshots_root;
-    let _ = snapshot_id;
 
     snapshot_then_write(manifest, filesystem, target, new_content.as_bytes())?;
     Ok(())
