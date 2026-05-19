@@ -1,0 +1,43 @@
+Source: virtu
+Section: admin
+Priority: optional
+Maintainer: Virtu Contributors <https://github.com/H-Sami/Virtu>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc (>= 1.74),
+ gzip
+Standards-Version: 4.6.2
+Homepage: https://github.com/H-Sami/Virtu
+Vcs-Git: https://github.com/H-Sami/Virtu.git
+Vcs-Browser: https://github.com/H-Sami/Virtu
+Rules-Requires-Root: no
+
+Package: virtu
+Architecture: amd64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ qemu-system-x86,
+ qemu-utils,
+ libvirt-clients,
+ libvirt-daemon-system,
+ ovmf,
+ bash
+Recommends:
+ virt-manager,
+ dnsmasq-base
+Description: Local-first Linux GPU passthrough automation tool
+ Virtu detects a Linux host's hardware and software configuration,
+ explains the viable GPU passthrough paths, generates a verified
+ plan, snapshots every file it may touch, applies changes atomically
+ with rollback support, and registers a libvirt domain.
+ .
+ The tool is designed around the principle of honest refusal: rather
+ than claim to "fix any PC", it explains exactly what is and isn't
+ possible on the detected host, and only mutates state through a
+ snapshot manifest that can be replayed in reverse.
+ .
+ Virtu never sends data to remote services, requires no account, and
+ runs entirely from local data. The bundled knowledge base of GPU
+ quirks and distro paths is compiled into the binary at build time.

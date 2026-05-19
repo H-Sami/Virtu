@@ -1,0 +1,8 @@
+virtu (0.1.0-1) unstable; urgency=medium
+
+  * Initial Debian / Ubuntu packaging for Milestone 10 (slice 10.7).
+  * Single binary plus shared man page; bundled knowledge base is
+    compiled in via include_str! so no runtime data files are needed.
+  * Hermetic test suite runs under override_dh_auto_test.
+
+ -- Virtu Contributors <https://github.com/H-Sami/Virtu>  Tue, 19 May 2026 00:00:00 +0000

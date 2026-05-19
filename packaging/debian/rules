@@ -1,0 +1,37 @@
+#!/usr/bin/make -f
+# Debian / Ubuntu rules file for Virtu (Milestone 10, slice 10.7).
+#
+# Virtu is a single Rust binary plus a shared man page; the build is
+# `cargo build --release --locked`. We bypass dh_auto_*'s default
+# Cargo handling because it expects the dh-cargo helper layout and
+# Virtu doesn't ship a debian/cargo-checksum.json. The recipe stays
+# distro-portable this way: the same `cargo build` command runs on
+# Debian, Ubuntu, and any downstream that ships cargo + rustc.
+
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked --bin virtu
+
+override_dh_auto_test:
+	# Hermetic test suite: MemoryFileSystem + fixture roots, no real
+	# host commands. Safe to run inside a sbuild / pbuilder chroot.
+	cargo test --release --locked
+
+override_dh_auto_install:
+	# Binary.
+	install -Dm755 \
+	    target/release/virtu \
+	    debian/virtu/usr/bin/virtu
+	# Man page (gzipped per Debian Policy 12.3).
+	install -Dm644 \
+	    packaging/share/man/virtu.1 \
+	    debian/virtu/usr/share/man/man1/virtu.1
+	gzip -9 debian/virtu/usr/share/man/man1/virtu.1
+
+override_dh_auto_clean:
+	rm -rf target
+	dh_auto_clean

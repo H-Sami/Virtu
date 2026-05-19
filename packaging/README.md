@@ -6,7 +6,7 @@ is a self-contained build target for one packaging format:
 - `arch/` — Arch Linux `PKGBUILD` consumed by `makepkg`.
 - `rpm/` — Fedora / openSUSE RPM `.spec` consumed by `rpmbuild`.
 - `debian/` — Debian / Ubuntu source-package layout consumed by
-  `dpkg-buildpackage` (added in slice 10.7).
+  `dpkg-buildpackage`.
 
 The shared man page lives in `share/man/virtu.1`. Every distro recipe
 installs it to its conventional manpage directory.
@@ -67,3 +67,22 @@ specific in the build path. The recipes differ only in:
 If a distro ever needs a real patch — e.g. an OVMF path that does not
 match what `src/kb/data/` ships — the right fix is to extend the
 bundled knowledge base, not to fork the binary per distro.
+
+## Building the Debian / Ubuntu package
+
+From a clean Debian or Ubuntu host with `build-essential`, `devscripts`,
+`debhelper-compat`, `cargo`, and `rustc` installed:
+
+```bash
+# From the repository root, copy the debian/ recipe in place and build:
+cp -r packaging/debian ./debian
+dpkg-buildpackage -us -uc -b
+sudo dpkg -i ../virtu_0.1.0-1_amd64.deb
+```
+
+The recipe builds Virtu with `cargo build --release --locked`, runs
+the hermetic test suite under `override_dh_auto_test`, installs the
+binary to `/usr/bin/virtu`, and gzips the man page to
+`/usr/share/man/man1/virtu.1.gz`. Runtime dependencies use Debian's
+canonical names (`qemu-system-x86`, `libvirt-clients`,
+`libvirt-daemon-system`, `ovmf`).
