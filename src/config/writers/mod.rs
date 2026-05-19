@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod grub;
+pub mod hooks;
 pub mod initramfs;
 pub mod systemd_boot;
 pub mod vfio_modprobe;
