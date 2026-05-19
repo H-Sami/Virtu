@@ -2,7 +2,7 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, the post-reboot `virtu resume` path, the libvirt domain XML refactor + registration step (Milestone 7), single-GPU passthrough hooks (Milestone 9), diagnostics knowledge base, TUI wizard, and native packaging for Arch/Fedora/Debian/Ubuntu/openSUSE (Milestone 10) are all in place. Real-hardware test matrix validation (final Milestone 10 slice) rounds out the v1.0 target.
+This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, the post-reboot `virtu resume` path, the libvirt domain XML refactor + registration step (Milestone 7), single-GPU passthrough hooks (Milestone 9), diagnostics knowledge base, TUI wizard, native packaging for Arch/Fedora/Debian/Ubuntu/openSUSE, and the real-hardware test matrix + reproduction harness (Milestone 10) are all in place. Final v1.0 work is the closeout audit and walking the matrix on real hardware.
 
 Looking Glass is explicitly out of scope for v1.0. The data model and validation still understand `LookingGlassChoice` for forward compatibility, but no installer or auto-build path will ship. Users who want Looking Glass can install the client manually after Virtu finishes.
 
@@ -50,3 +50,24 @@ The first production-quality slice should support:
 - Interactive TUI wizard for guided setup, or direct CLI commands for automation.
 
 Looking Glass is excluded from v1.0; users who want it integrate it manually after Virtu defines the VM.
+## Real-Hardware Testing
+
+Virtu's hermetic test suite covers every parser, writer, and executor against an in-memory filesystem. Real GPUs and reboots cannot be exercised that way, so the [`tests/HARDWARE_MATRIX.md`](tests/HARDWARE_MATRIX.md) document defines the priority-tiered test matrix v1.0 must walk before tagging:
+
+- Tier 1 (required for v1.0): NVIDIA dual-GPU on Arch + GRUB2 + SDDM + X11; AMD iGPU-host on Fedora + systemd-boot + GDM + Wayland; NVIDIA single-GPU on Arch + GRUB2 + SDDM + X11.
+- Tier 2 (recommended): Intel iGPU-host, AMD with Secure Boot, NVIDIA single-GPU on systemd-boot, AMD single-GPU on Fedora.
+- Tier 3 (stretch): exotic combinations including untested bootloaders, ship as known-limitations.
+
+The reproduction harness in [`tests/scripts/`](tests/scripts/) drives one cell at a time:
+
+```bash
+tests/scripts/run_hardware_test.sh scan                              # read-only preflight
+tests/scripts/run_hardware_test.sh apply --i-have-backups --confirm  # Phase A
+sudo systemctl reboot                                                # manual reboot
+tests/scripts/run_hardware_test.sh resume                            # Phase B
+tests/scripts/run_hardware_test.sh rollback --confirm                # optional rollback test
+```
+
+Output lands under `tests/results/<UTC-timestamp>/` (gitignored) with `scan.txt`, `plan.txt`, `phase_a.txt`, `resume.txt`, `status.txt`, plus pre/post host-fact dumps. Fill in [`tests/RESULTS_TEMPLATE.md`](tests/RESULTS_TEMPLATE.md) to record verdicts.
+
+When you find a regression, [`tests/scripts/capture_fixture.sh`](tests/scripts/capture_fixture.sh) snapshots the live host into a sanitized `tests/fixtures/<name>/` tree so the bug can be locked down with a hermetic regression test before it is fixed.
