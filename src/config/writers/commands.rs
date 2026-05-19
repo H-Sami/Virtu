@@ -163,9 +163,22 @@ pub fn run_update_initramfs_all() -> Result<(), CommandError> {
 /// caller invokes the validator. The returned handle keeps the file
 /// alive on disk; dropping it deletes the file.
 fn write_xml_to_tempfile(program: &str, content: &str) -> Result<NamedTempFile, CommandError> {
+    write_content_to_tempfile(program, content, "virtu-vm-", ".xml")
+}
+
+/// Stage `content` into a freshly-created tempfile with a caller-chosen
+/// prefix + suffix. Used by both `write_xml_to_tempfile` (suffix
+/// `.xml`) and the bash-syntax validator (suffix `.sh`). The returned
+/// handle keeps the file alive on disk; dropping it deletes the file.
+fn write_content_to_tempfile(
+    program: &str,
+    content: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Result<NamedTempFile, CommandError> {
     let mut file = tempfile::Builder::new()
-        .prefix("virtu-vm-")
-        .suffix(".xml")
+        .prefix(prefix)
+        .suffix(suffix)
         .tempfile()
         .map_err(|source| CommandError::TempFileIo {
             program: program.to_string(),
@@ -352,6 +365,36 @@ pub fn run_virsh_undefine(domain: &str) -> Result<(), CommandError> {
     run(PROGRAM, &["undefine", domain])
 }
 
+/// Run `bash -n <tempfile>` against the supplied bash script content.
+///
+/// Used by the single-GPU hook installer (slice 9.3) to syntax-check
+/// generated hook scripts before they ever land at
+/// `/etc/libvirt/hooks/qemu.d/<vm_name>/...`. A buggy hook script
+/// installed there can lock the user out of their host display
+/// manager, so this is a hard prerequisite.
+///
+/// The flow mirrors [`validate_xml`]:
+/// 1. Stage `content` into a temporary `.sh` file (auto-deleted).
+/// 2. Refuse if `bash` is not on PATH (`NotFound`).
+/// 3. Invoke `bash -n <tempfile>` directly with no shell interpolation.
+/// 4. Return `Ok(())` on exit code 0.
+/// 5. Return `NonZeroExit { stderr tail }` on a parse failure.
+pub fn validate_bash_script(content: &str) -> Result<(), CommandError> {
+    const PROGRAM: &str = "bash";
+
+    if !binary_available(PROGRAM) {
+        return Err(CommandError::NotFound {
+            program: PROGRAM.to_string(),
+        });
+    }
+
+    let tempfile = write_content_to_tempfile(PROGRAM, content, "virtu-hook-", ".sh")?;
+    let path = tempfile.path().to_path_buf();
+    let path_str = path.to_string_lossy().into_owned();
+
+    run(PROGRAM, &["-n", &path_str])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +497,34 @@ mod tests {
             !path.exists(),
             "the tempfile must be removed once the handle is dropped"
         );
+    }
+
+    /// `validate_bash_script` accepts well-formed bash. Bash is
+    /// effectively universal on Linux dev hosts, so this is a hermetic
+    /// happy-path test that confirms the wrapper does not falsely
+    /// reject a valid script.
+    #[test]
+    fn validate_bash_script_accepts_well_formed_script() {
+        if which::which("bash").is_err() {
+            return;
+        }
+        validate_bash_script("#!/usr/bin/env bash\nset -eu\necho ok\n")
+            .expect("well-formed bash script must validate");
+    }
+
+    /// `validate_bash_script` rejects a syntactically invalid script
+    /// with `NonZeroExit { program: "bash", .. }`. The stderr tail
+    /// should mention bash's complaint about the malformed line.
+    #[test]
+    fn validate_bash_script_rejects_malformed_script() {
+        if which::which("bash").is_err() {
+            return;
+        }
+        let err = validate_bash_script("if then echo broken").unwrap_err();
+        match err {
+            CommandError::NonZeroExit { program, .. } => assert_eq!(program, "bash"),
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
     }
 
     /// Optional real-host smoke test for `validate_xml`. Gated by an

@@ -483,9 +483,10 @@ mod tests {
     }
 
     /// Optional real-host syntax check. Pipes every variant we
-    /// generate through `bash -n` and asserts they all parse. Gated
-    /// behind the same env-var pattern as `validate_xml_real_host_smoke`
-    /// so normal `cargo test` stays hermetic.
+    /// generate through `bash -n` (via the `validate_bash_script`
+    /// wrapper) and asserts they all parse. Gated behind the same
+    /// env-var pattern as `validate_xml_real_host_smoke` so normal
+    /// `cargo test` stays hermetic.
     ///
     /// Set `VIRTU_RUN_BASH_SYNTAX_SMOKE=1` to opt in.
     #[test]
@@ -497,8 +498,7 @@ mod tests {
             return;
         }
 
-        use std::io::Write;
-        use std::process::Command;
+        use crate::config::writers::commands::validate_bash_script;
         let vendors = [
             GpuVendor::Nvidia,
             GpuVendor::Amd,
@@ -522,24 +522,11 @@ mod tests {
                     ("release", release_script(&input).unwrap()),
                     ("reattach", reattach_script(&input).unwrap()),
                 ] {
-                    let mut tmp = tempfile::Builder::new()
-                        .prefix("virtu-hook-")
-                        .suffix(".sh")
-                        .tempfile()
-                        .unwrap();
-                    tmp.as_file_mut().write_all(content.as_bytes()).unwrap();
-                    tmp.as_file_mut().flush().unwrap();
-                    let output = Command::new("bash")
-                        .arg("-n")
-                        .arg(tmp.path())
-                        .output()
-                        .unwrap();
-                    assert!(
-                        output.status.success(),
-                        "{label} script for vendor={vendor:?} dm={dm:?} failed bash -n: \
-                         stderr={}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
+                    if let Err(err) = validate_bash_script(&content) {
+                        panic!(
+                            "{label} script for vendor={vendor:?} dm={dm:?} failed bash -n: {err}"
+                        );
+                    }
                 }
             }
         }
