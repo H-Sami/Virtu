@@ -191,7 +191,7 @@ pub fn plan(
     if matches!(derived_mode, Some(GpuPassthroughMode::SingleGpu))
         || single_gpu_hook_handoff(config)
     {
-        steps.push(single_gpu_hook_step(profile));
+        steps.push(single_gpu_hook_step(profile, config));
     }
 
     if let LookingGlassChoice::Enabled { install_mode, .. } = &config.looking_glass {
@@ -435,20 +435,26 @@ fn initramfs_step(profile: &SystemProfile) -> Option<PlannedStep> {
     })
 }
 
-fn single_gpu_hook_step(profile: &SystemProfile) -> PlannedStep {
-    let hook_dir = PathBuf::from("/etc/libvirt/hooks/qemu.d");
+fn single_gpu_hook_step(profile: &SystemProfile, config: &PassthroughConfig) -> PlannedStep {
+    let qemu_d = PathBuf::from("/etc/libvirt/hooks/qemu.d");
+    let dispatcher = qemu_d.join(&config.vm_name);
+    let helper_dir = qemu_d.join(format!("{}.d", config.vm_name));
+    let release_helper = helper_dir.join("release");
+    let reattach_helper = helper_dir.join("reattach");
+
     PlannedStep {
         kind: StepKind::HookInstall,
-        title: "Install single-GPU passthrough hooks".to_string(),
+        title: format!("Install single-GPU passthrough hooks for `{}`", config.vm_name),
         summary: format!(
-            "Generate display-manager-aware libvirt hooks for {}/{} under /etc/libvirt/hooks/qemu.d/<vm>/. The host display server will be torn down when the VM starts and restored when it stops.",
+            "Generate display-manager-aware libvirt hooks for {}/{} under /etc/libvirt/hooks/qemu.d/{}/. The host display server will be torn down when the VM starts and restored when it stops.",
             profile.display_manager,
-            profile.display_server
+            profile.display_server,
+            config.vm_name,
         ),
         risk: StepRisk::High,
         privilege: PrivilegeNeed::RootViaSudo,
         state: StepState::Pending,
-        touches: vec![hook_dir.clone()],
+        touches: vec![dispatcher, release_helper, reattach_helper],
         commands: Vec::new(),
         verification: "Run each generated hook through `bash -n`; confirm the host display manager starts again after a synthetic stop event.".to_string(),
         rollback: "Remove generated hooks and restore the previous /etc/libvirt/hooks layout from the snapshot manifest. The user must reboot if the host display did not return.".to_string(),

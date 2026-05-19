@@ -587,6 +587,30 @@ pub enum PhaseBError {
         #[source]
         source: crate::config::writers::commands::CommandError,
     },
+    #[error("step {step:?}: hook script generation failed: {source}")]
+    HookGenerate {
+        step: StepKind,
+        #[source]
+        source: crate::config::writers::hooks::HookScriptError,
+    },
+    #[error(
+        "step {step:?}: bash -n rejected the generated `{script}` hook script for `{vm_name}`. \
+         Refusing to install: a syntactically broken hook can lock the user out of the host display manager: {source}"
+    )]
+    HookValidate {
+        step: StepKind,
+        vm_name: String,
+        script: String,
+        #[source]
+        source: Box<crate::config::writers::commands::CommandError>,
+    },
+    #[error("step {step:?}: failed to make hook script `{path}` executable: {source}")]
+    HookChmod {
+        step: StepKind,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Whether [`execute_phase_b`] should invoke the host commands its steps
@@ -721,11 +745,24 @@ pub fn execute_phase_b(
                 outcome.completed_steps.push(StepKind::VmRegister);
             }
 
+            StepKind::HookInstall => {
+                run_hook_install_step(
+                    step,
+                    pending,
+                    profile_after_reboot,
+                    filesystem,
+                    snapshots_root,
+                    &mut manifest,
+                    host_command_mode,
+                )?;
+                outcome.completed_steps.push(StepKind::HookInstall);
+            }
+
             // Future / cut milestones own these; for now Phase B records
             // them as deferred so the CLI can surface a clear "still on the
             // roadmap" message. LookingGlassInstall is permanently
             // deferred per the v1.0 cut.
-            StepKind::HookInstall | StepKind::LookingGlassInstall => {
+            StepKind::LookingGlassInstall => {
                 outcome.deferred_steps.push(step.kind.clone());
             }
 
@@ -1003,6 +1040,163 @@ fn run_vm_register_step(
     Ok(())
 }
 
+fn run_hook_install_step(
+    _step: &PlannedStep,
+    pending: &PendingPlan,
+    profile: &SystemProfile,
+    filesystem: &impl FileSystem,
+    snapshots_root: &Path,
+    manifest: &mut SnapshotManifest,
+    mode: HostCommandMode,
+) -> Result<(), PhaseBError> {
+    use crate::config::writers::commands::validate_bash_script;
+    use crate::config::writers::hooks::{
+        dispatcher_script, reattach_script, release_script, HookContext,
+    };
+
+    // 1. Build the HookContext from the post-reboot profile and the
+    //    pending plan. The passthrough GPU and its companion audio
+    //    drive the bind list; the host display manager drives the
+    //    `systemctl stop`/`start` calls inside the helper scripts.
+    let passthrough_gpu = pending
+        .config
+        .primary_passthrough_gpu(profile)
+        .ok_or_else(|| PhaseBError::Step {
+            step: StepKind::HookInstall,
+            detail: "single-GPU hook install requires exactly one passthrough GPU; \
+                     the user-choice config does not point at one"
+                .to_string(),
+        })?;
+
+    let mut vfio_pci_ids: Vec<String> = Vec::new();
+    vfio_pci_ids.push(format!(
+        "{}:{}",
+        passthrough_gpu.vendor_id, passthrough_gpu.device_id
+    ));
+    if let Some(audio) = &passthrough_gpu.companion_audio {
+        vfio_pci_ids.push(format!("{}:{}", audio.vendor_id, audio.device_id));
+    }
+
+    let hook_ctx = HookContext {
+        vm_name: pending.config.vm_name.clone(),
+        display_manager: profile.display_manager.clone(),
+        gpu_vendor: passthrough_gpu.vendor.clone(),
+        vfio_pci_ids,
+    };
+
+    let dispatcher =
+        dispatcher_script(&hook_ctx.vm_name).map_err(|source| PhaseBError::HookGenerate {
+            step: StepKind::HookInstall,
+            source,
+        })?;
+    let release = release_script(&hook_ctx).map_err(|source| PhaseBError::HookGenerate {
+        step: StepKind::HookInstall,
+        source,
+    })?;
+    let reattach = reattach_script(&hook_ctx).map_err(|source| PhaseBError::HookGenerate {
+        step: StepKind::HookInstall,
+        source,
+    })?;
+
+    // 2. Always validate. Even in Skip mode we want to ensure no
+    //    syntactically broken script can ever land. The validator runs
+    //    `bash -n`, which is hermetic and side-effect-free.
+    if mode == HostCommandMode::Run || which::which("bash").is_ok() {
+        for (label, content) in [
+            ("dispatcher", &dispatcher),
+            ("release", &release),
+            ("reattach", &reattach),
+        ] {
+            validate_bash_script(content).map_err(|source| PhaseBError::HookValidate {
+                step: StepKind::HookInstall,
+                vm_name: hook_ctx.vm_name.clone(),
+                script: label.to_string(),
+                source: Box::new(source),
+            })?;
+        }
+    }
+
+    // 3. Hook directory layout:
+    //
+    //     /etc/libvirt/hooks/qemu.d/<vm_name>            (dispatcher)
+    //     /etc/libvirt/hooks/qemu.d/<vm_name>.d/release  (helper)
+    //     /etc/libvirt/hooks/qemu.d/<vm_name>.d/reattach (helper)
+    //
+    // libvirt invokes the dispatcher; the dispatcher execs the helper
+    // matching the operation/sub-operation pair.
+    let qemu_d = std::path::PathBuf::from("/etc/libvirt/hooks/qemu.d");
+    let dispatcher_path = qemu_d.join(&hook_ctx.vm_name);
+    let helper_dir = qemu_d.join(format!("{}.d", hook_ctx.vm_name));
+    let release_path = helper_dir.join("release");
+    let reattach_path = helper_dir.join("reattach");
+
+    filesystem
+        .create_dir_all(&qemu_d)
+        .map_err(|source| PhaseBError::io(&qemu_d, source))?;
+    filesystem
+        .create_dir_all(&helper_dir)
+        .map_err(|source| PhaseBError::io(&helper_dir, source))?;
+
+    // 4. Declare every script the manifest must know about, *then*
+    //    write them. declare_created_entry is a no-op when the entry
+    //    already exists, so re-running this step is safe.
+    for path in [&dispatcher_path, &release_path, &reattach_path] {
+        let backup_relative = std::path::PathBuf::from(crate::snapshot::FILES_SUBDIR)
+            .join(crate::snapshot::sanitize_path(path));
+        crate::config::atomic_write::declare_created_entry(
+            manifest,
+            path,
+            &backup_relative,
+            StepKind::HookInstall,
+        );
+    }
+
+    // 5. Atomic-write each script through the snapshot machinery so
+    //    the manifest captures every byte.
+    for (path, content) in [
+        (&dispatcher_path, &dispatcher),
+        (&release_path, &release),
+        (&reattach_path, &reattach),
+    ] {
+        crate::config::atomic_write::snapshot_then_write(
+            manifest,
+            filesystem,
+            path,
+            content.as_bytes(),
+        )
+        .map_err(|source| PhaseBError::Persist {
+            step: StepKind::HookInstall,
+            source,
+        })?;
+    }
+
+    // 6. Mark every script executable. libvirt only invokes the
+    //    dispatcher, but the helpers must be executable too because
+    //    the dispatcher `exec`s them directly (a non-exec helper would
+    //    surface as a confusing libvirt hook failure at VM start).
+    for path in [&dispatcher_path, &release_path, &reattach_path] {
+        filesystem
+            .set_executable(path)
+            .map_err(|source| PhaseBError::HookChmod {
+                step: StepKind::HookInstall,
+                path: path.clone(),
+                source,
+            })?;
+    }
+
+    // 7. Persist the manifest now that every script is on disk and
+    //    executable. Then push the rollback action.
+    write_manifest(filesystem, snapshots_root, &pending.snapshot_id, manifest)?;
+    manifest.restore_actions.push(
+        crate::snapshot::manifest::RestoreAction::RemoveHookScripts {
+            vm_name: hook_ctx.vm_name.clone(),
+        },
+    );
+    write_manifest(filesystem, snapshots_root, &pending.snapshot_id, manifest)?;
+
+    Ok(())
+}
+
 fn run_verify_step(profile: &SystemProfile, pending: &PendingPlan) {
     println!("\n=== PHASE B VERIFY ===");
     println!(
@@ -1254,25 +1448,25 @@ mod phase_b_tests {
     }
 
     #[test]
-    fn phase_b_records_only_unimplemented_step_kinds_as_deferred() {
+    fn phase_b_records_looking_glass_install_as_deferred() {
         // After slice 7.6, VmXmlGenerate and VmRegister are no longer
-        // deferred — Phase B runs them. Only HookInstall (M9) and
-        // LookingGlassInstall (cut from v1.0) remain deferred.
+        // deferred — Phase B runs them. After slice 9.3, HookInstall is
+        // no longer deferred either. Only LookingGlassInstall (cut from
+        // v1.0) remains deferred. HookInstall is exercised separately in
+        // the dedicated single-GPU test below; this case keeps it out of
+        // the plan because the dummy profile uses
+        // `DisplayManager::Unknown`, which `run_hook_install_step` would
+        // (correctly) refuse.
         let fs = MemoryFileSystem::new();
         let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
         let state_root = PathBuf::from("/var/lib/virtu/state");
         let mut pending = dummy_pending(vec![
-            dummy_step(StepKind::HookInstall),
             dummy_step(StepKind::LookingGlassInstall),
             vm_xml_step_with_touch(),
             dummy_step(StepKind::VmRegister),
             dummy_step(StepKind::Verify),
         ]);
-        // The vm-xml step needs the parent dir to exist; the executor
-        // creates it but we still need a writable backing fs.
         pending.config.vm_name = "virtu-test".to_string();
-        // Seed the existing disk image so VmRegister's pre-check passes
-        // against MemoryFileSystem.
         let existing_disk = match &pending.config.resources.disk {
             crate::vm::DiskChoice::Existing { path } => path.clone(),
             _ => panic!("dummy_pending must use DiskChoice::Existing"),
@@ -1296,19 +1490,123 @@ mod phase_b_tests {
         )
         .unwrap();
 
-        // M9 / cut milestones are still deferred.
-        assert!(outcome.deferred_steps.contains(&StepKind::HookInstall));
         assert!(outcome
             .deferred_steps
             .contains(&StepKind::LookingGlassInstall));
+        assert!(!outcome.deferred_steps.contains(&StepKind::HookInstall));
 
-        // VmXmlGenerate now runs to completion; VmRegister too in Skip
-        // mode (skips the host commands).
         assert!(outcome.completed_steps.contains(&StepKind::VmXmlGenerate));
         assert!(outcome.completed_steps.contains(&StepKind::VmRegister));
         assert!(outcome.completed_steps.contains(&StepKind::Verify));
 
         assert!(outcome.pending_cleared);
+    }
+
+    #[test]
+    fn phase_b_hook_install_writes_dispatcher_and_helpers_executable() {
+        // Slice 9.3 happy path: a single-GPU plan with a known display
+        // manager produces three executable scripts at the canonical
+        // libvirt hook paths, plus a `RemoveHookScripts` rollback
+        // action.
+        use crate::detect::display_manager::DisplayManager;
+
+        let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        let mut pending = dummy_pending(vec![dummy_step(StepKind::HookInstall)]);
+        pending.config.vm_name = "virtu-singlegpu".to_string();
+        seed_test_manifest(&fs, &snapshots_root, &pending);
+        fs.create_dir_all(&state_root).unwrap();
+
+        let mut profile = dummy_profile_with_gpus();
+        profile.display_manager = DisplayManager::Sddm;
+
+        let outcome = execute_phase_b(
+            &pending,
+            &profile,
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .expect("hook install must succeed against the in-memory FS");
+
+        assert!(outcome.completed_steps.contains(&StepKind::HookInstall));
+
+        let dispatcher = PathBuf::from("/etc/libvirt/hooks/qemu.d/virtu-singlegpu");
+        let release = PathBuf::from("/etc/libvirt/hooks/qemu.d/virtu-singlegpu.d/release");
+        let reattach = PathBuf::from("/etc/libvirt/hooks/qemu.d/virtu-singlegpu.d/reattach");
+
+        for path in [&dispatcher, &release, &reattach] {
+            assert!(fs.exists(path), "hook script {} must exist", path.display());
+            assert!(
+                fs.is_executable(path),
+                "hook script {} must be marked executable",
+                path.display()
+            );
+        }
+
+        let dispatcher_text = String::from_utf8(fs.read(&dispatcher).unwrap()).unwrap();
+        assert!(
+            dispatcher_text.contains("HOOK_DIR=\"/etc/libvirt/hooks/qemu.d/virtu-singlegpu.d\"")
+        );
+        assert!(dispatcher_text.contains("if [ \"$vm\" != 'virtu-singlegpu' ]; then"));
+
+        let release_text = String::from_utf8(fs.read(&release).unwrap()).unwrap();
+        assert!(release_text.contains("systemctl stop sddm"));
+        assert!(release_text.contains("modprobe vfio-pci"));
+
+        let reattach_text = String::from_utf8(fs.read(&reattach).unwrap()).unwrap();
+        assert!(reattach_text.contains("systemctl start sddm"));
+
+        // Manifest carries a RemoveHookScripts action keyed on the
+        // actual vm_name.
+        let manifest_path = snapshots_root
+            .join(&pending.snapshot_id)
+            .join(crate::snapshot::MANIFEST_FILENAME);
+        let manifest_text = String::from_utf8(fs.read(&manifest_path).unwrap()).unwrap();
+        let manifest: SnapshotManifest = toml::from_str(&manifest_text).unwrap();
+        assert!(manifest.restore_actions.iter().any(|a| matches!(
+            a,
+            crate::snapshot::RestoreAction::RemoveHookScripts { vm_name } if vm_name == "virtu-singlegpu"
+        )));
+    }
+
+    #[test]
+    fn phase_b_hook_install_refuses_unknown_display_manager() {
+        // Defense-in-depth: slice 9.1 already refuses Unknown DMs at the
+        // template level. Phase B must surface that as a structured
+        // `HookGenerate` error instead of crashing or installing
+        // garbage. The dummy profile already uses
+        // `DisplayManager::Unknown`, so this is the natural test.
+        let fs = MemoryFileSystem::new();
+        let snapshots_root = PathBuf::from("/var/lib/virtu/snapshots");
+        let state_root = PathBuf::from("/var/lib/virtu/state");
+        let mut pending = dummy_pending(vec![dummy_step(StepKind::HookInstall)]);
+        pending.config.vm_name = "virtu-singlegpu".to_string();
+        seed_test_manifest(&fs, &snapshots_root, &pending);
+        fs.create_dir_all(&state_root).unwrap();
+
+        let err = execute_phase_b(
+            &pending,
+            &dummy_profile_with_gpus(),
+            &fs,
+            &snapshots_root,
+            &state_root,
+            HostCommandMode::Skip,
+        )
+        .unwrap_err();
+
+        match err {
+            PhaseBError::HookGenerate { step, source } => {
+                assert_eq!(step, StepKind::HookInstall);
+                assert!(matches!(
+                    source,
+                    crate::config::writers::hooks::HookScriptError::UnknownDisplayManager
+                ));
+            }
+            other => panic!("expected HookGenerate(UnknownDisplayManager), got {other:?}"),
+        }
     }
 
     #[test]

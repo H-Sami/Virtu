@@ -71,7 +71,56 @@ pub struct HookContext {
     pub vfio_pci_ids: Vec<String>,
 }
 
-/// Generate the contents of `prepare/begin/<vm_name>`.
+/// Generate the contents of the libvirt-invoked dispatcher at
+/// `/etc/libvirt/hooks/qemu.d/<vm_name>`.
+///
+/// libvirt calls this script with positional arguments
+/// `<vm_name> <operation> <sub-operation> <extra>` and reads the
+/// operation/sub-operation pair from `$2/$3`. The dispatcher is the
+/// only file libvirt actually executes; the heavy lifting lives in the
+/// helper scripts under `<vm_name>.d/`. Splitting them keeps the
+/// helpers testable on their own, and gives `bash -n` a single small
+/// dispatcher to validate without re-validating the entire helper.
+///
+/// Recognized hook events (from libvirt docs):
+///
+/// - `prepare/begin` → release the GPU (run `release` helper).
+/// - `release/end`   → re-attach the GPU (run `reattach` helper).
+///
+/// Any other operation/sub-operation pair returns 0 immediately so
+/// libvirt's regular flow is undisturbed.
+pub fn dispatcher_script(vm_name: &str) -> Result<String, HookScriptError> {
+    let mut script = String::new();
+    write_header(
+        &mut script,
+        vm_name,
+        "dispatcher",
+        "route libvirt hook events to per-stage helpers",
+    )?;
+    writeln!(
+        script,
+        "# Hook dir layout: /etc/libvirt/hooks/qemu.d/{vm_name}.d/"
+    )?;
+    writeln!(script, "HOOK_DIR=\"/etc/libvirt/hooks/qemu.d/{vm_name}.d\"")?;
+    writeln!(script)?;
+    writeln!(script, "vm=\"$1\"")?;
+    writeln!(script, "op=\"${{2:-}}\"")?;
+    writeln!(script, "sub=\"${{3:-}}\"")?;
+    writeln!(script)?;
+    writeln!(
+        script,
+        "if [ \"$vm\" != '{vm_name}' ]; then\n  # libvirt calls every hook with the domain name as $1; ignore other domains.\n  exit 0\nfi"
+    )?;
+    writeln!(script)?;
+    writeln!(
+        script,
+        "case \"$op/$sub\" in\n  prepare/begin)\n    exec \"$HOOK_DIR/release\" \"$@\"\n    ;;\n  release/end)\n    exec \"$HOOK_DIR/reattach\" \"$@\"\n    ;;\n  *)\n    # No-op for any other libvirt event. Exit 0 so libvirt does not abort the VM.\n    exit 0\n    ;;\nesac"
+    )?;
+
+    Ok(script)
+}
+
+/// Generate the contents of the `<vm_name>.d/release` helper script.
 ///
 /// The script:
 /// - sets a strict shell (`set -eu`),
@@ -89,7 +138,7 @@ pub fn release_script(ctx: &HookContext) -> Result<String, HookScriptError> {
     write_header(
         &mut script,
         &ctx.vm_name,
-        "prepare/begin",
+        "release helper (prepare/begin)",
         "release the GPU from the host",
     )?;
     write_recovery_trap(
@@ -148,7 +197,7 @@ pub fn reattach_script(ctx: &HookContext) -> Result<String, HookScriptError> {
     write_header(
         &mut script,
         &ctx.vm_name,
-        "release/end",
+        "reattach helper (release/end)",
         "re-attach the GPU to the host",
     )?;
     write_recovery_trap(
@@ -482,6 +531,29 @@ mod tests {
         assert!(script.contains("trap _virtu_recovery ERR"));
     }
 
+    /// Dispatcher routes `prepare/begin` to the `release` helper and
+    /// `release/end` to the `reattach` helper. Anything else is a no-op
+    /// so libvirt's hook flow is undisturbed.
+    #[test]
+    fn dispatcher_script_routes_known_events_to_helpers() {
+        let script = dispatcher_script("virtu-windows").expect("renders");
+        assert!(script.starts_with("#!/usr/bin/env bash\n"));
+        assert!(script.contains("HOOK_DIR=\"/etc/libvirt/hooks/qemu.d/virtu-windows.d\""));
+        assert!(script.contains("op=\"${2:-}\""));
+        assert!(script.contains("sub=\"${3:-}\""));
+        // libvirt invokes every hook with the domain name as $1; the
+        // dispatcher must short-circuit when called for a different
+        // domain so a multi-domain host stays sane.
+        assert!(script.contains("if [ \"$vm\" != 'virtu-windows' ]; then"));
+        // Dispatch table.
+        assert!(script.contains("prepare/begin)"));
+        assert!(script.contains("exec \"$HOOK_DIR/release\" \"$@\""));
+        assert!(script.contains("release/end)"));
+        assert!(script.contains("exec \"$HOOK_DIR/reattach\" \"$@\""));
+        // Default branch exits 0 so libvirt does not abort the VM.
+        assert!(script.contains("exit 0"));
+    }
+
     /// Optional real-host syntax check. Pipes every variant we
     /// generate through `bash -n` (via the `validate_bash_script`
     /// wrapper) and asserts they all parse. Gated behind the same
@@ -518,6 +590,13 @@ mod tests {
             for dm in &dms {
                 let mut input = ctx(vendor.clone(), dm.clone());
                 input.vfio_pci_ids = vec!["10de:1f08".to_string()];
+                let dispatcher = dispatcher_script(&input.vm_name).unwrap();
+                if let Err(err) = validate_bash_script(&dispatcher) {
+                    panic!(
+                        "dispatcher script for vm={} failed bash -n: {err}",
+                        input.vm_name
+                    );
+                }
                 for (label, content) in [
                     ("release", release_script(&input).unwrap()),
                     ("reattach", reattach_script(&input).unwrap()),

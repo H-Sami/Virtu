@@ -39,6 +39,16 @@ pub trait FileSystem {
     /// Remove a regular file. Returns [`io::ErrorKind::NotFound`] if the
     /// file was already absent.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+
+    /// Mark `path` as executable for owner / group / other. Used by the
+    /// single-GPU hook installer (slice 9.3) so libvirt can actually run
+    /// the generated dispatcher and helper scripts. The file at `path`
+    /// must exist; missing files return [`io::ErrorKind::NotFound`].
+    ///
+    /// On Unix this is `chmod 0o755`. On non-Unix targets this is a
+    /// no-op (the trait still returns `Ok(())` so callers don't have to
+    /// branch on platform); production use is Linux-only.
+    fn set_executable(&self, path: &Path) -> io::Result<()>;
 }
 
 /// Production [`FileSystem`] backed by `std::fs` and [`tempfile`].
@@ -113,6 +123,28 @@ impl FileSystem for RealFileSystem {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+
+    fn set_executable(&self, path: &Path) -> io::Result<()> {
+        if !path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("set_executable: {} does not exist", path.display()),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms)?;
+        }
+        #[cfg(not(unix))]
+        {
+            // No-op on non-Unix; production is Linux-only.
+            let _ = path;
+        }
+        Ok(())
+    }
 }
 
 /// In-memory [`FileSystem`] for tests. Stores file contents in a sorted map
@@ -128,6 +160,7 @@ pub struct MemoryFileSystem {
 struct MemoryFsState {
     files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
     dirs: std::collections::BTreeSet<PathBuf>,
+    executable: std::collections::BTreeSet<PathBuf>,
 }
 
 impl MemoryFileSystem {
@@ -268,7 +301,38 @@ impl FileSystem for MemoryFileSystem {
                 format!("memory fs: no file at {}", path.display()),
             ));
         }
+        state.executable.remove(path);
         Ok(())
+    }
+
+    fn set_executable(&self, path: &Path) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("memory fs mutex poisoned"))?;
+        if !state.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "memory fs: cannot mark missing file executable: {}",
+                    path.display()
+                ),
+            ));
+        }
+        state.executable.insert(path.to_path_buf());
+        Ok(())
+    }
+}
+
+impl MemoryFileSystem {
+    /// Test helper: returns `true` if `path` was marked executable via
+    /// `set_executable`.
+    pub fn is_executable(&self, path: impl AsRef<Path>) -> bool {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        state.executable.contains(path.as_ref())
     }
 }
 

@@ -127,6 +127,12 @@ pub enum RestoreAction {
     /// appends this restore action to the manifest only after `virsh
     /// define` succeeds.
     UndefineLibvirtDomain { name: String },
+    /// Remove the single-GPU hook scripts Phase B installed for `vm_name`.
+    /// The dispatcher and the helper directory live under
+    /// `/etc/libvirt/hooks/qemu.d/` and `/etc/libvirt/hooks/qemu.d/<vm>.d/`.
+    /// Phase B appends this action only after every script has been
+    /// successfully written and made executable.
+    RemoveHookScripts { vm_name: String },
     /// Inform the user that the host must reboot for the rollback to be
     /// fully effective. Carries no command because reboots cannot be
     /// automated safely from inside Virtu.
@@ -149,6 +155,9 @@ impl RestoreAction {
             RestoreAction::UndefineLibvirtDomain { name } => {
                 format!("Undefine libvirt domain: virsh undefine {name}")
             }
+            RestoreAction::RemoveHookScripts { vm_name } => format!(
+                "Remove single-GPU libvirt hook scripts for {vm_name}: rm -f /etc/libvirt/hooks/qemu.d/{vm_name} && rm -rf /etc/libvirt/hooks/qemu.d/{vm_name}.d"
+            ),
             RestoreAction::RecommendReboot => "Reboot to fully apply the rollback.".to_string(),
         }
     }
