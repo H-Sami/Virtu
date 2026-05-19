@@ -67,6 +67,24 @@ pub enum Divergence {
     /// added it to the initramfs. Either the rebuild did not run or the
     /// module was unloaded post-boot.
     VfioModuleNotLoaded,
+    /// A single-GPU hook script that the manifest says Phase B
+    /// installed is now missing on the host filesystem.
+    HookScriptMissing { vm_name: String, path: String },
+    /// A single-GPU hook script exists on the host but its content has
+    /// changed since Phase B wrote it. The captured hash and the live
+    /// hash are reported so the user can spot tampering or partial
+    /// regeneration.
+    HookScriptDivergent {
+        vm_name: String,
+        path: String,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+    /// A single-GPU hook script exists with the right content but is
+    /// not marked executable. libvirt would fail to invoke it at VM
+    /// start; we surface this as a divergence so the user sees the
+    /// problem before running the VM.
+    HookScriptNotExecutable { vm_name: String, path: String },
 }
 
 impl Divergence {
@@ -92,6 +110,25 @@ impl Divergence {
                 "vfio_pci is not in the loaded module list. Initramfs rebuild may not have applied."
                     .to_string()
             }
+            Divergence::HookScriptMissing { vm_name, path } => format!(
+                "Single-GPU hook script for `{vm_name}` is missing at `{path}`. The host display manager won't release the GPU when the VM starts."
+            ),
+            Divergence::HookScriptDivergent {
+                vm_name,
+                path,
+                expected_sha256,
+                actual_sha256,
+            } => format!(
+                "Single-GPU hook script for `{vm_name}` at `{path}` has been modified \
+                 since Phase B installed it (expected sha256 {}…, found {}…). \
+                 Re-run `virtu apply` to regenerate, or roll back.",
+                &expected_sha256[..expected_sha256.len().min(8)],
+                &actual_sha256[..actual_sha256.len().min(8)]
+            ),
+            Divergence::HookScriptNotExecutable { vm_name, path } => format!(
+                "Single-GPU hook script for `{vm_name}` at `{path}` is not executable. \
+                 libvirt will refuse to run it. Re-run `virtu apply` or `chmod +x` it manually."
+            ),
         }
     }
 }
@@ -251,6 +288,96 @@ fn host_identity_changes(profile: &SystemProfile, expected: &HostFingerprint) ->
     out
 }
 
+/// Verify that every single-GPU hook script Phase B claims to have
+/// installed is still on disk, byte-identical to the captured
+/// `post_edit_sha256`, and marked executable.
+///
+/// Pure read-only check. Returns a (possibly empty) list of
+/// [`Divergence`]s — one per failed expectation. Callers integrate the
+/// list into their existing `ResumeReadiness::NotReady` handling.
+///
+/// `vm_name` filters the manifest entries: only those keyed on the
+/// expected libvirt domain are checked. This lets a future multi-domain
+/// host avoid false positives when one of several pending VMs has been
+/// torn down independently.
+pub fn verify_hook_install(
+    manifest: &crate::snapshot::manifest::SnapshotManifest,
+    filesystem: &impl crate::snapshot::FileSystem,
+    vm_name: &str,
+) -> Vec<Divergence> {
+    use crate::engine::step::StepKind;
+    use sha2::{Digest, Sha256};
+
+    let mut divergences = Vec::new();
+
+    for entry in &manifest.entries {
+        if entry.produced_by != StepKind::HookInstall {
+            continue;
+        }
+        let path = entry.original_path.clone();
+        let path_str = path.display().to_string();
+
+        // 1. Presence.
+        if !filesystem.exists(&path) {
+            divergences.push(Divergence::HookScriptMissing {
+                vm_name: vm_name.to_string(),
+                path: path_str.clone(),
+            });
+            continue;
+        }
+
+        // 2. Content matches the captured post-edit hash. Skip when the
+        // entry has no post-edit hash (means Phase B persisted the
+        // entry but the writer did not finish; that's a Phase B bug we
+        // surface as a divergence).
+        match (&entry.post_edit_sha256, filesystem.read(&path)) {
+            (Some(expected), Ok(bytes)) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let actual = hex::encode(hasher.finalize());
+                if &actual != expected {
+                    divergences.push(Divergence::HookScriptDivergent {
+                        vm_name: vm_name.to_string(),
+                        path: path_str.clone(),
+                        expected_sha256: expected.clone(),
+                        actual_sha256: actual,
+                    });
+                    continue;
+                }
+            }
+            (None, _) => {
+                divergences.push(Divergence::HookScriptDivergent {
+                    vm_name: vm_name.to_string(),
+                    path: path_str.clone(),
+                    expected_sha256: "(not recorded)".to_string(),
+                    actual_sha256: "(unknown)".to_string(),
+                });
+                continue;
+            }
+            (Some(_), Err(_)) => {
+                divergences.push(Divergence::HookScriptMissing {
+                    vm_name: vm_name.to_string(),
+                    path: path_str.clone(),
+                });
+                continue;
+            }
+        }
+
+        // 3. Executable bit. The `FileSystem` trait exposes
+        // `is_executable` so we get a single uniform check across the
+        // `RealFileSystem` (mode bits) and `MemoryFileSystem`
+        // (recorded set).
+        if !filesystem.is_executable(&path) {
+            divergences.push(Divergence::HookScriptNotExecutable {
+                vm_name: vm_name.to_string(),
+                path: path_str,
+            });
+        }
+    }
+
+    divergences
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +447,248 @@ mod tests {
             }],
         }
         .is_ready());
+    }
+
+    // ---- verify_hook_install -----------------------------------------
+
+    use crate::engine::planner::PlanSummary;
+    use crate::engine::step::StepKind as StepKind2;
+    use crate::snapshot::manifest::{HostSummary, SnapshotEntry, SnapshotManifest};
+    use crate::snapshot::{FileSystem, MemoryFileSystem};
+    use std::path::PathBuf;
+
+    fn empty_summary() -> PlanSummary {
+        PlanSummary {
+            total_steps: 0,
+            pending_steps: 0,
+            already_satisfied_steps: 0,
+            max_risk: crate::engine::step::StepRisk::ReadOnly,
+            requires_reboot: false,
+            requires_confirmation: false,
+        }
+    }
+
+    fn host_summary() -> HostSummary {
+        HostSummary {
+            distro_id: "arch".to_string(),
+            distro_pretty_name: "Arch".to_string(),
+            kernel_version: "6.10.0".to_string(),
+            bootloader: crate::detect::bootloader::BootloaderKind::Grub2,
+            initramfs: crate::detect::initramfs::InitramfsSystem::Mkinitcpio,
+        }
+    }
+
+    /// Build a manifest with three HookInstall entries (dispatcher +
+    /// release + reattach), seeding each path on the supplied
+    /// MemoryFileSystem with the byte content `bytes`. The post-edit
+    /// hash on the entry is set from the bytes so the verifier finds a
+    /// match.
+    fn seed_hook_manifest_and_fs(
+        fs: &MemoryFileSystem,
+        vm_name: &str,
+        bytes_per_path: &[(&str, &[u8])],
+    ) -> SnapshotManifest {
+        use sha2::{Digest, Sha256};
+        fs.create_dir_all(std::path::Path::new("/etc/libvirt/hooks/qemu.d"))
+            .unwrap();
+        fs.create_dir_all(std::path::Path::new(&format!(
+            "/etc/libvirt/hooks/qemu.d/{}.d",
+            vm_name
+        )))
+        .unwrap();
+
+        let mut manifest =
+            SnapshotManifest::new("snap-id", host_summary(), empty_summary(), Vec::new());
+
+        for (path, bytes) in bytes_per_path {
+            let abs = PathBuf::from(*path);
+            fs.write_atomic(&abs, bytes).unwrap();
+            fs.set_executable(&abs).unwrap();
+
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            let hash = hex::encode(hasher.finalize());
+
+            manifest.push_entry(SnapshotEntry {
+                original_path: abs.clone(),
+                backup_path: PathBuf::from(format!(
+                    "files/{}",
+                    crate::snapshot::sanitize_path(&abs)
+                )),
+                pre_edit_sha256: String::new(),
+                post_edit_sha256: Some(hash),
+                original_existed: false,
+                produced_by: StepKind2::HookInstall,
+            });
+        }
+        manifest
+    }
+
+    #[test]
+    fn verify_hook_install_returns_empty_when_every_script_is_intact() {
+        let fs = MemoryFileSystem::new();
+        let manifest = seed_hook_manifest_and_fs(
+            &fs,
+            "virtu-windows",
+            &[
+                ("/etc/libvirt/hooks/qemu.d/virtu-windows", b"#!/bin/bash\n"),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/release",
+                    b"# release",
+                ),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/reattach",
+                    b"# reattach",
+                ),
+            ],
+        );
+
+        let divergences = verify_hook_install(&manifest, &fs, "virtu-windows");
+        assert!(
+            divergences.is_empty(),
+            "expected no divergences, got {divergences:?}"
+        );
+    }
+
+    #[test]
+    fn verify_hook_install_reports_missing_script_when_file_was_deleted() {
+        let fs = MemoryFileSystem::new();
+        let manifest = seed_hook_manifest_and_fs(
+            &fs,
+            "virtu-windows",
+            &[
+                ("/etc/libvirt/hooks/qemu.d/virtu-windows", b"#!/bin/bash\n"),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/release",
+                    b"# release",
+                ),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/reattach",
+                    b"# reattach",
+                ),
+            ],
+        );
+
+        // User (or some other process) removed the dispatcher between
+        // Phase B and a re-verify.
+        fs.remove_file(std::path::Path::new(
+            "/etc/libvirt/hooks/qemu.d/virtu-windows",
+        ))
+        .unwrap();
+
+        let divergences = verify_hook_install(&manifest, &fs, "virtu-windows");
+        assert_eq!(divergences.len(), 1);
+        match &divergences[0] {
+            Divergence::HookScriptMissing { vm_name, path } => {
+                assert_eq!(vm_name, "virtu-windows");
+                assert_eq!(path, "/etc/libvirt/hooks/qemu.d/virtu-windows");
+            }
+            other => panic!("expected HookScriptMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_hook_install_reports_divergent_script_when_content_changed() {
+        let fs = MemoryFileSystem::new();
+        let manifest = seed_hook_manifest_and_fs(
+            &fs,
+            "virtu-windows",
+            &[
+                ("/etc/libvirt/hooks/qemu.d/virtu-windows", b"#!/bin/bash\n"),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/release",
+                    b"# release",
+                ),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/reattach",
+                    b"# reattach",
+                ),
+            ],
+        );
+
+        // Tamper with the release helper — same path, different bytes.
+        fs.write_atomic(
+            std::path::Path::new("/etc/libvirt/hooks/qemu.d/virtu-windows.d/release"),
+            b"# tampered with",
+        )
+        .unwrap();
+
+        let divergences = verify_hook_install(&manifest, &fs, "virtu-windows");
+        assert_eq!(divergences.len(), 1);
+        match &divergences[0] {
+            Divergence::HookScriptDivergent {
+                vm_name,
+                path,
+                expected_sha256,
+                actual_sha256,
+            } => {
+                assert_eq!(vm_name, "virtu-windows");
+                assert!(path.ends_with("/release"));
+                assert_ne!(expected_sha256, actual_sha256);
+            }
+            other => panic!("expected HookScriptDivergent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_hook_install_reports_not_executable_when_chmod_was_dropped() {
+        // Build the manifest+filesystem normally, then strip the
+        // executable bit on the dispatcher. The verifier must report
+        // exactly one HookScriptNotExecutable divergence; the other
+        // two scripts are still fine.
+        let fs = MemoryFileSystem::new();
+        let manifest = seed_hook_manifest_and_fs(
+            &fs,
+            "virtu-windows",
+            &[
+                ("/etc/libvirt/hooks/qemu.d/virtu-windows", b"#!/bin/bash\n"),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/release",
+                    b"# release",
+                ),
+                (
+                    "/etc/libvirt/hooks/qemu.d/virtu-windows.d/reattach",
+                    b"# reattach",
+                ),
+            ],
+        );
+
+        // Drop the executable bit on the dispatcher only. There is no
+        // public "unset_executable" on the trait; we simulate it by
+        // re-creating the file (write_atomic does not preserve the
+        // bit, since MemoryFileSystem clears it on remove and
+        // write_atomic does not implicitly set it).
+        let dispatcher = std::path::Path::new("/etc/libvirt/hooks/qemu.d/virtu-windows");
+        fs.remove_file(dispatcher).unwrap();
+        fs.write_atomic(dispatcher, b"#!/bin/bash\n").unwrap();
+        // do *not* call set_executable — leave the file there but not exec.
+
+        let divergences = verify_hook_install(&manifest, &fs, "virtu-windows");
+        assert_eq!(divergences.len(), 1);
+        match &divergences[0] {
+            Divergence::HookScriptNotExecutable { vm_name, path } => {
+                assert_eq!(vm_name, "virtu-windows");
+                assert_eq!(path, "/etc/libvirt/hooks/qemu.d/virtu-windows");
+            }
+            other => panic!("expected HookScriptNotExecutable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hook_divergence_human_summaries_mention_vm_name_and_path() {
+        let missing = Divergence::HookScriptMissing {
+            vm_name: "virtu-windows".to_string(),
+            path: "/etc/libvirt/hooks/qemu.d/virtu-windows".to_string(),
+        };
+        let summary = missing.human_summary();
+        assert!(summary.contains("virtu-windows"));
+        assert!(summary.contains("/etc/libvirt/hooks/qemu.d/virtu-windows"));
+
+        let not_exec = Divergence::HookScriptNotExecutable {
+            vm_name: "virtu-windows".to_string(),
+            path: "/etc/libvirt/hooks/qemu.d/virtu-windows".to_string(),
+        };
+        let summary = not_exec.human_summary();
+        assert!(summary.contains("not executable"));
     }
 }

@@ -15,6 +15,8 @@ pub use executor::{
     PhaseAError, PhaseAOutcome, PhaseBError, PhaseBOutcome, RegenerateMode,
 };
 pub use planner::{build_plan, plan, Plan, PlanError, PlanSummary};
-pub use resume::{verify_phase_a_landed, Divergence, HostMismatch, ResumeReadiness};
+pub use resume::{
+    verify_hook_install, verify_phase_a_landed, Divergence, HostMismatch, ResumeReadiness,
+};
 pub use step::{PlannedStep, PrivilegeNeed, StepKind, StepRisk, StepState};
 pub use vm_xml::generate_vm_xml;

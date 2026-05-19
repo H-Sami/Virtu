@@ -49,6 +49,14 @@ pub trait FileSystem {
     /// no-op (the trait still returns `Ok(())` so callers don't have to
     /// branch on platform); production use is Linux-only.
     fn set_executable(&self, path: &Path) -> io::Result<()>;
+
+    /// Return `true` if `path` exists and has any executable bit set.
+    /// Used by the single-GPU hook verifier (slice 9.4) to confirm
+    /// libvirt will actually be able to invoke the installed hook
+    /// scripts. Implementations that cannot inspect the bit (such as
+    /// [`MemoryFileSystem`]) report based on whatever was last
+    /// recorded by [`Self::set_executable`].
+    fn is_executable(&self, path: &Path) -> bool;
 }
 
 /// Production [`FileSystem`] backed by `std::fs` and [`tempfile`].
@@ -144,6 +152,25 @@ impl FileSystem for RealFileSystem {
             let _ = path;
         }
         Ok(())
+    }
+
+    fn is_executable(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(path) {
+                Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            // No mode bits on non-Unix; conservatively report true so
+            // higher-level checks don't false-positive against test
+            // hosts. Production is Linux-only.
+            true
+        }
     }
 }
 
@@ -322,17 +349,22 @@ impl FileSystem for MemoryFileSystem {
         state.executable.insert(path.to_path_buf());
         Ok(())
     }
-}
 
-impl MemoryFileSystem {
-    /// Test helper: returns `true` if `path` was marked executable via
-    /// `set_executable`.
-    pub fn is_executable(&self, path: impl AsRef<Path>) -> bool {
+    fn is_executable(&self, path: &Path) -> bool {
         let state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => return false,
         };
-        state.executable.contains(path.as_ref())
+        state.executable.contains(path)
+    }
+}
+
+impl MemoryFileSystem {
+    /// Test helper: returns `true` if `path` was marked executable via
+    /// `set_executable`. Same as [`FileSystem::is_executable`]; kept for
+    /// readability in tests that hold a `MemoryFileSystem` directly.
+    pub fn is_executable_helper(&self, path: impl AsRef<Path>) -> bool {
+        FileSystem::is_executable(self, path.as_ref())
     }
 }
 
