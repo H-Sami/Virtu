@@ -2,7 +2,7 @@
 
 Virtu is a Rust-based Linux GPU passthrough automation tool. Its goal is to guide a user from system detection to a working libvirt VM while making every risky system change inspectable, reversible, and verified.
 
-This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, the post-reboot `virtu resume` path, the libvirt domain XML refactor + registration step (Milestone 7), and most of the single-GPU passthrough hook work (Milestone 9 slices 9.1 - 9.4) are all in place. The single-GPU integration test (Milestone 9 slice 9.5) and the diagnostics/packaging polish (Milestone 10) round out the v1.0 target.
+This repository is in active development. Detection, compatibility reporting, user-choice modeling with read-only validation (including VM-name conflict and character-set checks), dry-run planning, snapshot capture, manifest-backed atomic writes, rollback, Phase-A safe writers (GRUB / systemd-boot / VFIO / initramfs) with host-command regenerate, the post-reboot `virtu resume` path, the libvirt domain XML refactor + registration step (Milestone 7), single-GPU passthrough hooks (Milestone 9), diagnostics knowledge base, TUI wizard, and native packaging for Arch/Fedora/Debian/Ubuntu/openSUSE (Milestone 10) are all in place. Real-hardware test matrix validation (final Milestone 10 slice) rounds out the v1.0 target.
 
 Looking Glass is explicitly out of scope for v1.0. The data model and validation still understand `LookingGlassChoice` for forward compatibility, but no installer or auto-build path will ship. Users who want Looking Glass can install the client manually after Virtu finishes.
 
@@ -11,6 +11,7 @@ Looking Glass is explicitly out of scope for v1.0. The data model and validation
 ```bash
 cargo check
 cargo test
+cargo run -- wizard                        # Interactive TUI wizard (detection → choices → plan → confirm)
 cargo run -- scan                          # Detect host and print compatibility findings
 cargo run -- plan                          # Build a dry-run plan from recommended choices
 cargo run -- status                        # Show current VFIO binding and IOMMU state
@@ -42,9 +43,10 @@ GPU passthrough requires a host reboot to apply bootloader, initramfs, and modul
 
 The first production-quality slice should support:
 
-- Arch, Fedora, Debian/Ubuntu, and openSUSE families.
+- Arch, Fedora, Debian/Ubuntu, and openSUSE families (native packages available for all).
 - GRUB2 and systemd-boot first, then rEFInd, Syslinux/Extlinux, and EFISTUB.
-- Dual GPU and iGPU-host setups before single-GPU hooks; single-GPU hooks land in Milestone 9 alongside `bash -n` validation, a hook installer wired into Phase B, and a manifest-backed verifier so rollback knows exactly what to clean up.
+- Dual GPU, iGPU-host, and single-GPU passthrough (with libvirt hook scripts for display manager release/reattach).
 - User-selected VM OS, ISO, RAM, CPU count, storage, monitor plan, and keyboard/mouse passthrough.
+- Interactive TUI wizard for guided setup, or direct CLI commands for automation.
 
 Looking Glass is excluded from v1.0; users who want it integrate it manually after Virtu defines the VM.
