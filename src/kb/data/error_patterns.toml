@@ -1,0 +1,100 @@
+# Bundled error-pattern database. `engine::diagnose_error` walks this
+# list and returns the first match. Each `[[patterns]]` table declares:
+#
+#   id           stable identifier (logged so a future update can
+#                trace which entry fired).
+#   regex        Rust-`regex`-compatible pattern. Anchor with care;
+#                most of these match a substring of stderr output.
+#   cause        one-line summary the CLI prints first.
+#   fix_options  ordered remediation steps.
+#
+# Patterns are tried top-to-bottom; put the most specific entries first
+# so a generic fallback at the bottom doesn't shadow them.
+
+# vfio container open fails when /dev/vfio/<group> isn't readable by
+# the libvirt user. The classic "Permission denied" trail.
+[[patterns]]
+id = "vfio-permission-denied"
+regex = "vfio: error opening /dev/vfio/[0-9]+: Permission denied"
+cause = "libvirt cannot open the VFIO group device. The user libvirt runs as is not in the `kvm` group, or udev did not grant the group read permission."
+fix_options = [
+    "Confirm `qemu` runs as the `libvirt-qemu` (Debian/Ubuntu) or `qemu` (Arch/Fedora/openSUSE) user, and that the user is in the `kvm` group.",
+    "Re-login or run `newgrp kvm` so the new group membership takes effect for the current shell.",
+    "Inspect the udev rule at `/usr/lib/udev/rules.d/80-vfio.rules`; on some distros you must add `OWNER=\"libvirt-qemu\"` or set `MODE=\"0660\"`.",
+]
+
+# Same family but the IOMMU container itself rejects the open. Almost
+# always means iommu= is not on the kernel cmdline OR the user's
+# kernel is not built with CONFIG_VFIO_IOMMU_TYPE1.
+[[patterns]]
+id = "vfio-set-iommu-failed"
+regex = "vfio: failed to set iommu for container: Operation not permitted"
+cause = "The IOMMU is not enabled on this host. The kernel cmdline is missing `intel_iommu=on` / `amd_iommu=on`, or the kernel does not have IOMMU support compiled in."
+fix_options = [
+    "Reboot and confirm `dmesg | grep -i iommu` shows the IOMMU is enabled.",
+    "If the cmdline edit didn't stick, re-run `virtu apply --phase a --confirm` to regenerate the bootloader entry.",
+    "Verify with `ls /sys/kernel/iommu_groups/` — if empty, the IOMMU is off.",
+]
+
+# qemu refuses to access /dev/kvm. Either KVM isn't loaded or the user
+# isn't in the kvm group.
+[[patterns]]
+id = "kvm-permission-denied"
+regex = "Could not access KVM kernel module: Permission denied"
+cause = "The user running qemu is not in the `kvm` group, so /dev/kvm is read-only."
+fix_options = [
+    "Add the user to the `kvm` group: `sudo usermod -aG kvm $USER`.",
+    "Log out and back in, or run `newgrp kvm` for the current shell.",
+    "Confirm `ls -l /dev/kvm` shows `crw-rw---- root kvm`.",
+]
+
+# KVM module not loaded at all. Common on bare metal where nested
+# virtualization is off.
+[[patterns]]
+id = "kvm-module-missing"
+regex = "Could not access KVM kernel module: No such file or directory"
+cause = "/dev/kvm does not exist. The `kvm_intel` or `kvm_amd` module is not loaded, virtualization is disabled in the BIOS, or the host itself is a VM without nested virtualization."
+fix_options = [
+    "Confirm CPU virtualization (VT-x / AMD-V) is enabled in the BIOS.",
+    "Run `sudo modprobe kvm_intel` or `sudo modprobe kvm_amd` and inspect `dmesg` for refusal reasons.",
+    "If this host is itself a VM, enable nested virtualization on the outer hypervisor.",
+]
+
+# qemu-img refuses to overwrite an existing image. Surfaces when
+# DiskChoice::Create points at an existing path.
+[[patterns]]
+id = "qemu-img-exists"
+regex = "qemu-img: .*: File exists"
+cause = "qemu-img refused to create the disk image because a file already exists at that path."
+fix_options = [
+    "Choose a different disk path in the wizard.",
+    "Manually remove the existing file (`rm <path>`) — but only if you are sure no VM still references it.",
+    "Switch the disk choice from `Create` to `Existing` if the image is already what you want.",
+]
+
+# virsh complains the domain is already defined. Rare in practice
+# because Virtu's planner already runs the libvirt-domain-name
+# uniqueness check, but a stale leftover from a previous failed run
+# can still trigger this.
+[[patterns]]
+id = "virsh-domain-already-defined"
+regex = "operation failed: domain '[^']+' already exists"
+cause = "A libvirt domain with that name is already defined on the host."
+fix_options = [
+    "Inspect with `virsh list --all` and decide whether to keep or undefine the existing domain.",
+    "If it's a leftover from a previous Virtu run, undefine it: `virsh undefine <name>` (add `--nvram` if NVRAM is configured).",
+    "Pick a different `vm_name` in the wizard.",
+]
+
+# Generic fallback that matches the libvirt qemu setup-container
+# message. This is broader than the vfio-set-iommu pattern above and
+# fires when iommu groups aren't isolated.
+[[patterns]]
+id = "vfio-setup-container-failed"
+regex = "vfio [0-9a-f:.]+: failed to setup container for group [0-9]+"
+cause = "vfio-pci could not take ownership of one of the devices in the IOMMU group. Either the host driver still holds it, or another device in the same group is bound to a host driver."
+fix_options = [
+    "Confirm every device in the IOMMU group is bound to vfio-pci or the pci-stub driver.",
+    "Re-check `ls /sys/kernel/iommu_groups/<n>/devices/` and compare against `lspci -nnk`.",
+    "If a non-display device shares the group (USB controller, PCIe bridge), you may need ACS-override patches — Virtu does not enable these automatically.",
+]

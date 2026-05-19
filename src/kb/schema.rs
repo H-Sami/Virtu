@@ -35,3 +35,21 @@ pub struct ErrorPattern {
     pub cause: String,
     pub fix_options: Vec<String>,
 }
+
+/// Wrapper TOML schema for the bundled `gpu_quirks.toml` file. Kept
+/// separate from [`GpuQuirk`] so the file format is forward-compatible:
+/// adding new top-level keys (`schema_version`, etc.) does not require
+/// rewriting every quirk.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GpuQuirksFile {
+    #[serde(default)]
+    pub quirks: Vec<GpuQuirk>,
+}
+
+/// Wrapper TOML schema for the bundled `error_patterns.toml` file. See
+/// [`GpuQuirksFile`] for the rationale.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ErrorPatternsFile {
+    #[serde(default)]
+    pub patterns: Vec<ErrorPattern>,
+}

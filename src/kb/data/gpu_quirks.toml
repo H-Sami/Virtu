@@ -1,0 +1,64 @@
+# Bundled GPU quirks database. Loaded via `include_str!` so the binary
+# never depends on external files; user overrides at runtime go through
+# `KnowledgeBase::from_file`.
+#
+# Each `[[quirks]]` table describes one quirk:
+#
+#   issue_id            stable identifier the rest of the codebase
+#                       matches on (e.g. "reset-bug" is referenced by
+#                       src/vm/xml/mod.rs to insert the firmware
+#                       <pm><suspend-to-mem enabled='no'/></pm> block).
+#   vendor_id           4-hex-digit PCI vendor id (lowercase, no `0x`).
+#   device_id_pattern   "*" matches any device id from this vendor;
+#                       otherwise an exact 4-hex match.
+#   description         one-line summary surfaced in the wizard / scan
+#                       output.
+#   fixes               ordered remediation steps the user can follow.
+#                       Free-form text; the wizard prints them verbatim.
+
+# AMD Vega / Navi PCIe reset bug. The card refuses to FLR when the VM
+# stops, so the second VM start hangs. Real fix is the out-of-tree
+# `vendor-reset` kernel module; the wizard surfaces this so the user
+# is not surprised.
+[[quirks]]
+issue_id = "reset-bug"
+vendor_id = "1002"
+device_id_pattern = "*"
+description = "AMD GPUs frequently exhibit the PCIe reset bug; the host needs `vendor-reset` for reliable VM restarts."
+fixes = [
+    "Install the `vendor-reset` DKMS module (see https://github.com/gnif/vendor-reset).",
+    "Add `vendor-reset` to your initramfs MODULES list and rebuild.",
+    "Confirm with `cat /sys/bus/pci/devices/<gpu-slot>/reset_method` that `device_specific` is selected.",
+]
+
+# NVIDIA consumer (GeForce) GPUs return device id 0x43 to the guest
+# driver when they detect virtualization, refusing to load. The
+# mitigation lives in the libvirt XML (kvm hidden state + a fake
+# vendor_id), which Virtu already emits via vm/xml/devices/features.rs.
+# The quirk entry exists so the diagnostics layer can explain the
+# symptom if a user ever reports "Code 43".
+[[quirks]]
+issue_id = "nvidia-code-43"
+vendor_id = "10de"
+device_id_pattern = "*"
+description = "NVIDIA consumer drivers return Code 43 in the guest unless virtualization is hidden. Virtu already emits the kvm hidden-state XML; this entry exists for diagnostics."
+fixes = [
+    "Confirm the generated XML carries <kvm><hidden state='on'/></kvm> and <vendor_id state='on' value='...'/>.",
+    "If the symptom persists, blacklist `nouveau` on the host so it does not race the unbind.",
+    "Verify the guest is using a recent NVIDIA driver (>= 465 ignores Code 43 even without the workaround on most cards).",
+]
+
+# Intel iGPU passthrough is best-effort. Full passthrough often requires
+# UPT/SR-IOV-capable parts (e.g. Tiger Lake or later); GVT-g is now
+# upstream-removed. The wizard surfaces this so the user does not waste
+# time chasing a setup that the kernel no longer supports.
+[[quirks]]
+issue_id = "intel-igpu-passthrough"
+vendor_id = "8086"
+device_id_pattern = "*"
+description = "Intel iGPU passthrough requires UPT/SR-IOV-capable hardware; GVT-g was removed upstream in 6.x kernels."
+fixes = [
+    "If the host CPU is Tiger Lake or newer, enable SR-IOV in the BIOS and pass through a virtual function.",
+    "On older hardware, prefer keeping the iGPU on the host and passing through a discrete GPU.",
+    "GVT-g is not supported by Virtu and not recommended on modern kernels.",
+]
