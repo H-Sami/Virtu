@@ -4,7 +4,7 @@ This directory holds distro-specific packaging recipes. Each subfolder
 is a self-contained build target for one packaging format:
 
 - `arch/` — Arch Linux `PKGBUILD` consumed by `makepkg`.
-- `rpm/` — Fedora / openSUSE RPM `.spec` consumed by `rpmbuild` (added in slice 10.6).
+- `rpm/` — Fedora / openSUSE RPM `.spec` consumed by `rpmbuild`.
 - `debian/` — Debian / Ubuntu source-package layout consumed by
   `dpkg-buildpackage` (added in slice 10.7).
 
@@ -25,6 +25,33 @@ The `PKGBUILD` builds Virtu with `cargo build --release --frozen`,
 installs the binary to `/usr/bin/virtu`, the man page to
 `/usr/share/man/man1/virtu.1.gz`, and the bundled `MIT` license to
 `/usr/share/licenses/virtu/LICENSE`.
+
+## Building the RPM package (Fedora / openSUSE)
+
+From a clean Fedora or openSUSE host with `cargo`, `rust`, and
+`rpm-build` installed:
+
+```bash
+cd packaging/rpm
+rpmdev-setuptree
+tar -czf ~/rpmbuild/SOURCES/virtu-0.1.0.tar.gz \
+    --transform 's,^,virtu-0.1.0/,' \
+    -C ../../ \
+    Cargo.toml Cargo.lock src tests packaging/share README.md
+cp virtu.spec ~/rpmbuild/SPECS/
+rpmbuild -ba ~/rpmbuild/SPECS/virtu.spec
+sudo dnf install ~/rpmbuild/RPMS/x86_64/virtu-*.rpm   # Fedora
+# or
+sudo zypper install ~/rpmbuild/RPMS/x86_64/virtu-*.rpm  # openSUSE
+```
+
+The `.spec` builds Virtu with `cargo build --release --locked`,
+runs the hermetic test suite under `%check`, installs the binary to
+`/usr/bin/virtu`, and gzips the man page to `/usr/share/man/man1/`.
+Distro-specific runtime dependencies (`qemu-system-x86` vs `qemu-x86`,
+`edk2-ovmf` vs `qemu-ovmf-x86_64`, etc.) are gated by
+`%if 0%{?suse_version}` blocks so a single recipe covers both
+distros.
 
 ## Why no per-distro patches?
 
