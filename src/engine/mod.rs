@@ -4,6 +4,7 @@ pub mod executor;
 pub mod planner;
 pub mod resume;
 pub mod step;
+pub mod vm_xml;
 
 pub use compatibility::{
     build_compatibility_report, CompatibilityFinding, CompatibilityReport, CompatibilityStatus,
@@ -16,3 +17,4 @@ pub use executor::{
 pub use planner::{build_plan, plan, Plan, PlanError, PlanSummary};
 pub use resume::{verify_phase_a_landed, Divergence, HostMismatch, ResumeReadiness};
 pub use step::{PlannedStep, PrivilegeNeed, StepKind, StepRisk, StepState};
+pub use vm_xml::generate_vm_xml;

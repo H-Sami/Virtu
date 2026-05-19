@@ -2,14 +2,15 @@ pub mod devices;
 
 use crate::detect::SystemProfile;
 use crate::kb::KnowledgeBase;
-use crate::vm::profile::VmView;
+use crate::vm::profile::{VmView, VmViewError};
 use crate::vm::AudioChoice;
-use anyhow::Result;
 use std::fmt::Write as FmtWrite;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum XmlError {
+    #[error("failed to derive VM XML view: {0}")]
+    View(#[from] VmViewError),
     #[error("failed to write XML fragment")]
     Format(#[from] std::fmt::Error),
 }
@@ -27,7 +28,7 @@ impl<'a> XmlBuilder<'a> {
         Self { view, system, kb }
     }
 
-    pub fn build(&self) -> Result<String> {
+    pub fn build(&self) -> Result<String, XmlError> {
         let mut xml = String::with_capacity(8192);
 
         writeln!(
@@ -48,7 +49,7 @@ impl<'a> XmlBuilder<'a> {
         Ok(xml)
     }
 
-    fn write_identity(&self, xml: &mut String) -> Result<()> {
+    fn write_identity(&self, xml: &mut String) -> Result<(), XmlError> {
         writeln!(xml, "  <name>{}</name>", self.view.vm_name)?;
         writeln!(xml, "  <uuid>{}</uuid>", uuid::Uuid::new_v4())?;
         writeln!(
@@ -63,7 +64,7 @@ impl<'a> XmlBuilder<'a> {
         Ok(())
     }
 
-    fn render_devices(&self) -> Result<String> {
+    fn render_devices(&self) -> Result<String, XmlError> {
         let mut xml = String::new();
 
         writeln!(xml, "  <devices>")?;
@@ -92,7 +93,7 @@ impl<'a> XmlBuilder<'a> {
         Ok(xml)
     }
 
-    fn write_audio(&self, xml: &mut String) -> Result<()> {
+    fn write_audio(&self, xml: &mut String) -> Result<(), XmlError> {
         match self.view.audio {
             AudioChoice::HostAudio => {
                 let audio_type = self.system.audio.libvirt_audio_type();
@@ -119,7 +120,7 @@ impl<'a> XmlBuilder<'a> {
         Ok(())
     }
 
-    fn write_qemu_commandline(&self, xml: &mut String) -> Result<()> {
+    fn write_qemu_commandline(&self, xml: &mut String) -> Result<(), XmlError> {
         let gpu = self.view.passthrough_gpu;
 
         // AMD reset bug mitigation.
