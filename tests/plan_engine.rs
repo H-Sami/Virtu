@@ -151,6 +151,76 @@ async fn igpu_host_plan_is_ordered_and_declares_safety_fields() {
 }
 
 #[tokio::test]
+async fn bootloader_step_emits_vfio_pci_ids_in_sorted_order() {
+    // Regression for the post-slice-10.8 audit (Finding B). The
+    // planner used to build `vfio-pci.ids=...` from the GPU role
+    // iteration order (GPU first, audio companion second), while
+    // the executor wrote the sorted form to /etc/default/grub. The
+    // user-visible plan output drifted from the bytes Phase A
+    // actually wrote.
+    //
+    // The fixture sysfs has NVIDIA dGPU `10de:2684` plus its HDMI
+    // audio companion `10de:22ba`. Insertion order would yield
+    // `10de:2684,10de:22ba`; sorted order is `10de:22ba,10de:2684`
+    // because the audio device id sorts ahead of the GPU's. We
+    // pin the sorted form.
+    let profile = fixture_profile().await;
+    let report = build_compatibility_report(&profile);
+    let config = PassthroughConfig::recommended_defaults(&profile).unwrap();
+
+    let plan = plan(&profile, &report, &config).unwrap();
+    let bootloader_step = find_step(&plan, StepKind::BootloaderWrite);
+
+    assert!(
+        bootloader_step
+            .summary
+            .contains("vfio-pci.ids=10de:22ba,10de:2684"),
+        "expected sorted vfio-pci.ids in summary, got: {}",
+        bootloader_step.summary
+    );
+    // Defense-in-depth: the unsorted form must not appear anywhere
+    // in the summary. A future regression would either drop the
+    // sort or split the list across two assertions.
+    assert!(
+        !bootloader_step.summary.contains("10de:2684,10de:22ba"),
+        "unsorted vfio-pci.ids found in summary; planner regressed: {}",
+        bootloader_step.summary
+    );
+}
+
+#[tokio::test]
+async fn bootloader_step_already_satisfied_when_sorted_cmdline_matches() {
+    // Regression for the post-slice-10.8 audit (Finding B). After
+    // Phase A writes the sorted `vfio-pci.ids=...` token to
+    // /etc/default/grub and the host reboots, a re-plan against
+    // the live host's `/proc/cmdline` (which carries the sorted
+    // form) must mark the bootloader step as `AlreadySatisfied`.
+    // Before the fix, the planner built an insertion-order token
+    // and `cmdline.contains(&unsorted_token)` returned false even
+    // though the bootloader file already had the right values.
+    let mut profile = fixture_profile().await;
+    // Simulate the post-Phase-A cmdline. Match the AMD/Intel CPU
+    // detection in `bootloader_step` by checking what the fixture
+    // actually has; the cpuinfo fixture is Intel.
+    profile.kernel_cmdline = "BOOT_IMAGE=/vmlinuz-linux \
+         root=UUID=test rw quiet \
+         intel_iommu=on iommu=pt \
+         vfio-pci.ids=10de:22ba,10de:2684"
+        .to_string();
+
+    let report = build_compatibility_report(&profile);
+    let config = PassthroughConfig::recommended_defaults(&profile).unwrap();
+    let plan = plan(&profile, &report, &config).unwrap();
+    let bootloader_step = find_step(&plan, StepKind::BootloaderWrite);
+
+    assert_eq!(
+        bootloader_step.state,
+        StepState::AlreadySatisfied,
+        "bootloader step must detect a sorted vfio-pci.ids in /proc/cmdline as already-satisfied"
+    );
+}
+
+#[tokio::test]
 async fn bootloader_step_targets_detected_grub_config_and_includes_vfio_ids() {
     let profile = fixture_profile().await;
     let report = build_compatibility_report(&profile);

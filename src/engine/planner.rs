@@ -622,6 +622,15 @@ fn verify_step() -> PlannedStep {
     }
 }
 
+/// PCI ids the user wants passed through, sorted lexicographically and
+/// deduplicated. Mirrors what `engine::executor::passthrough_pci_ids`
+/// produces post-sort, so the plan's printed `vfio-pci.ids=...`
+/// description matches the bytes the executor will eventually write
+/// to `/etc/default/grub` and `/etc/modprobe.d/virtu-vfio.conf`. The
+/// `pci_ids_already_have` substring check below also depends on this
+/// ordering: the bootloader file is always sorted, so re-planning a
+/// host that already had Phase A applied must build the same sorted
+/// token to detect the `AlreadySatisfied` state.
 fn passthrough_pci_ids(profile: &SystemProfile, config: &PassthroughConfig) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for assignment in &config.gpu_roles {
@@ -646,6 +655,8 @@ fn passthrough_pci_ids(profile: &SystemProfile, config: &PassthroughConfig) -> V
             }
         }
     }
+    ids.sort();
+    ids.dedup();
     ids
 }
 
