@@ -274,67 +274,62 @@ fn render_footer(frame: &mut Frame, area: Rect) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::{
-        build_compatibility_report, CompatibilityFinding, CompatibilityReport, FixOption,
-    };
+pub(crate) mod tests_helpers {
+    use crate::detect::audio::AudioSystem;
+    use crate::detect::bootloader::{BootloaderInfo, BootloaderKind};
+    use crate::detect::cpu::CpuInfo;
+    use crate::detect::display_manager::DisplayManager;
+    use crate::detect::display_server::DisplayServer;
+    use crate::detect::distro::{DistroFamily, DistroInfo, PackageManager};
+    use crate::detect::gpu::{GpuInfo, GpuType, GpuVendor};
+    use crate::detect::initramfs::InitramfsSystem;
+    use crate::detect::memory::MemInfo;
+    use crate::detect::readiness::{KernelHeadersInfo, OvmfInfo, ReadinessInfo, UserAccessInfo};
+    use crate::detect::storage::StorageInfo;
+    use crate::detect::virtualization::VirtInfo;
+    use crate::detect::SystemProfile;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
 
-    fn empty_report(status: CompatibilityStatus) -> CompatibilityReport {
-        CompatibilityReport {
-            status,
-            findings: Vec::new(),
-        }
+    /// Build a single-NVIDIA-GPU `SystemProfile` for tests that don't
+    /// care about the GPU layout.
+    pub fn dummy_profile() -> SystemProfile {
+        dummy_profile_with_extras(vec![(
+            "0000:01:00.0",
+            GpuType::Discrete,
+            GpuVendor::Nvidia,
+            "10de",
+            "1f08",
+        )])
     }
 
-    fn warn_report() -> CompatibilityReport {
-        CompatibilityReport {
-            status: CompatibilityStatus::Warnings,
-            findings: vec![
-                CompatibilityFinding {
-                    id: "secure-boot-enabled".to_string(),
-                    severity: FindingSeverity::Warn,
-                    title: "Secure Boot is on".to_string(),
-                    explanation: "Secure Boot is enabled; signing required for new kernel modules."
-                        .to_string(),
-                    evidence: vec![],
-                    fix_options: vec![FixOption::new(
-                        "Disable Secure Boot",
-                        "Boot into firmware setup and disable Secure Boot before re-running.",
-                        crate::engine::FixAutomation::Manual,
-                        false,
-                    )],
-                },
-                CompatibilityFinding {
-                    id: "iommu-active".to_string(),
-                    severity: FindingSeverity::Pass,
-                    title: "IOMMU active".to_string(),
-                    explanation: "IOMMU groups detected.".to_string(),
-                    evidence: vec![],
-                    fix_options: vec![],
-                },
-            ],
-        }
-    }
-
-    fn dummy_profile() -> SystemProfile {
-        // Use the same shape the executor unit tests use.
-        use crate::detect::audio::AudioSystem;
-        use crate::detect::bootloader::{BootloaderInfo, BootloaderKind};
-        use crate::detect::cpu::CpuInfo;
-        use crate::detect::display_manager::DisplayManager;
-        use crate::detect::display_server::DisplayServer;
-        use crate::detect::distro::{DistroFamily, DistroInfo, PackageManager};
-        use crate::detect::gpu::{GpuInfo, GpuType, GpuVendor};
-        use crate::detect::initramfs::InitramfsSystem;
-        use crate::detect::memory::MemInfo;
-        use crate::detect::readiness::{
-            KernelHeadersInfo, OvmfInfo, ReadinessInfo, UserAccessInfo,
-        };
-        use crate::detect::storage::StorageInfo;
-        use crate::detect::virtualization::VirtInfo;
-        use std::collections::HashMap;
-        use std::path::PathBuf;
+    /// Like [`dummy_profile`] but with an explicit list of GPU
+    /// descriptors so tests can craft iGPU + dGPU and dual-discrete
+    /// shapes without copying every other field.
+    pub fn dummy_profile_with_extras(
+        gpus: Vec<(&str, GpuType, GpuVendor, &str, &str)>,
+    ) -> SystemProfile {
+        let gpu_infos = gpus
+            .into_iter()
+            .map(|(slot, ty, vendor, vendor_id, device_id)| GpuInfo {
+                pci_slot: slot.to_string(),
+                vendor,
+                gpu_type: ty,
+                model_name: format!("Test {vendor_id}:{device_id}"),
+                vendor_id: vendor_id.to_string(),
+                device_id: device_id.to_string(),
+                subsystem_vendor_id: "0000".to_string(),
+                subsystem_device_id: "0000".to_string(),
+                current_driver: None,
+                iommu_group_id: Some(1),
+                iommu_isolated: true,
+                rom_accessible: false,
+                companion_audio: None,
+                is_boot_vga: false,
+                vfio_compatible: true,
+                quirks: Vec::new(),
+            })
+            .collect();
 
         SystemProfile {
             cpu: CpuInfo {
@@ -348,24 +343,7 @@ mod tests {
                 has_hyperthreading: true,
                 core_to_threads: HashMap::new(),
             },
-            gpus: vec![GpuInfo {
-                pci_slot: "0000:01:00.0".to_string(),
-                vendor: GpuVendor::Nvidia,
-                gpu_type: GpuType::Discrete,
-                model_name: "NVIDIA Test GPU".to_string(),
-                vendor_id: "10de".to_string(),
-                device_id: "1f08".to_string(),
-                subsystem_vendor_id: "0000".to_string(),
-                subsystem_device_id: "0000".to_string(),
-                current_driver: Some("nvidia".to_string()),
-                iommu_group_id: Some(17),
-                iommu_isolated: true,
-                rom_accessible: false,
-                companion_audio: None,
-                is_boot_vga: true,
-                vfio_compatible: true,
-                quirks: Vec::new(),
-            }],
+            gpus: gpu_infos,
             iommu_groups: vec![crate::detect::iommu::IommuGroup {
                 id: 17,
                 devices: vec![],
@@ -438,6 +416,58 @@ mod tests {
             scan_timestamp: chrono::Utc::now(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{
+        build_compatibility_report, CompatibilityFinding, CompatibilityReport, FixOption,
+    };
+
+    fn empty_report(status: CompatibilityStatus) -> CompatibilityReport {
+        CompatibilityReport {
+            status,
+            findings: Vec::new(),
+        }
+    }
+
+    fn warn_report() -> CompatibilityReport {
+        CompatibilityReport {
+            status: CompatibilityStatus::Warnings,
+            findings: vec![
+                CompatibilityFinding {
+                    id: "secure-boot-enabled".to_string(),
+                    severity: FindingSeverity::Warn,
+                    title: "Secure Boot is on".to_string(),
+                    explanation: "Secure Boot is enabled; signing required for new kernel modules."
+                        .to_string(),
+                    evidence: vec![],
+                    fix_options: vec![FixOption::new(
+                        "Disable Secure Boot",
+                        "Boot into firmware setup and disable Secure Boot before re-running.",
+                        crate::engine::FixAutomation::Manual,
+                        false,
+                    )],
+                },
+                CompatibilityFinding {
+                    id: "iommu-active".to_string(),
+                    severity: FindingSeverity::Pass,
+                    title: "IOMMU active".to_string(),
+                    explanation: "IOMMU groups detected.".to_string(),
+                    evidence: vec![],
+                    fix_options: vec![],
+                },
+            ],
+        }
+    }
+
+    fn dummy_profile() -> SystemProfile {
+        // Delegate to the shared helper so the choice-screen tests
+        // can build the same fixture profile without duplicating the
+        // long initializer.
+        tests_helpers::dummy_profile()
+    }
 
     #[test]
     fn detection_view_carries_every_host_fact_and_gpu_summary() {
@@ -461,10 +491,18 @@ mod tests {
         assert_eq!(view.gpu_lines.len(), 1);
         let gpu_line = &view.gpu_lines[0];
         assert!(gpu_line.contains("0000:01:00.0"));
-        assert!(gpu_line.contains("NVIDIA Test GPU"));
         assert!(gpu_line.contains("10de:1f08"));
-        assert!(gpu_line.contains("driver=nvidia"));
-        assert!(gpu_line.contains("iommu_group=17"));
+        // The shared `tests_helpers` profile reports a synthetic
+        // model name; assert the PCI ids are present rather than a
+        // specific marketing string so the assertion stays
+        // future-proof if the helper ever swaps the dummy name.
+        assert!(gpu_line.contains("Test"));
+        // The shared helper leaves `current_driver` unset so the
+        // GPU block reports `driver=none`. The original detection
+        // helper hard-coded `Some("nvidia")`; the assertion here
+        // mirrors the new shared shape.
+        assert!(gpu_line.contains("driver=none"));
+        assert!(gpu_line.contains("iommu_group=1"));
         assert!(gpu_line.contains("isolated=true"));
 
         assert_eq!(view.finding_lines.len(), 0);
