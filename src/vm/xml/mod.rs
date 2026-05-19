@@ -36,11 +36,20 @@ impl<'a> XmlBuilder<'a> {
             "<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>"
         )?;
 
+        // libvirt's domain Relax-NG schema is strict about ordering.
+        // Pre-`<os>`: identity, then memory, then `<vcpu>` /
+        // `<iothreads>` / `<cputune>`. Post-`<os>`: `<features>`,
+        // `<cpu>`, `<clock>`. Then `<devices>` and any
+        // `<qemu:commandline>` overrides. Emitting `<vcpu>` after
+        // `<features>` (the previous layout) made
+        // `virt-xml-validate` reject the document with
+        // "Extra element features in interleave".
         self.write_identity(&mut xml)?;
+        xml.push_str(&devices::memory::render(self.view)?);
+        xml.push_str(&devices::cpu::render_resources(self.view, self.system)?);
         xml.push_str(&devices::firmware::render(self.view, self.system, self.kb)?);
         xml.push_str(&devices::features::render(self.view)?);
-        xml.push_str(&devices::cpu::render(self.view, self.system)?);
-        xml.push_str(&devices::memory::render(self.view)?);
+        xml.push_str(&devices::cpu::render_processor(self.view, self.system)?);
         xml.push_str(&self.render_devices()?);
         self.write_qemu_commandline(&mut xml)?;
 
@@ -67,8 +76,17 @@ impl<'a> XmlBuilder<'a> {
     fn render_devices(&self) -> Result<String, XmlError> {
         let mut xml = String::new();
 
+        // Look up the QEMU emulator path from the bundled knowledge
+        // base. Each distro family maps to its canonical install path
+        // (e.g. Arch and Debian both ship at /usr/bin/qemu-system-x86_64;
+        // a custom-built host can override the table by loading a
+        // user TOML through `KnowledgeBase::from_files`). Hard-coding
+        // /usr/bin here would break hosts that ship qemu under
+        // /usr/local/bin (typical for Spice-enabled custom builds).
+        let qemu_binary = &self.kb.paths_for_distro(&self.system.distro).qemu_binary;
+
         writeln!(xml, "  <devices>")?;
-        writeln!(xml, "    <emulator>/usr/bin/qemu-system-x86_64</emulator>")?;
+        writeln!(xml, "    <emulator>{qemu_binary}</emulator>")?;
         xml.push_str(&devices::disk::render(self.view)?);
         xml.push_str(&devices::network::render(self.view)?);
         xml.push_str(&devices::gpu_hostdev::render(self.view)?);

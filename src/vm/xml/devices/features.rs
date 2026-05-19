@@ -10,6 +10,16 @@ pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
     writeln!(xml, "    <acpi/>")?;
     writeln!(xml, "    <apic/>")?;
 
+    // OVMF Secure Boot relies on SMM to keep the variable store
+    // tamper-resistant. Emitting `<smm state='on'/>` is the
+    // schema-correct way to express that; the OS firmware block
+    // (in firmware.rs) only writes `<loader>`/`<nvram>`/etc., and
+    // the misnamed `<smmbios>` element does not exist in the
+    // libvirt domain schema.
+    if view.enable_secure_boot {
+        writeln!(xml, "    <smm state='on'/>")?;
+    }
+
     if view.enable_hyperv {
         writeln!(xml, "    <hyperv mode='custom'>")?;
         writeln!(xml, "      <relaxed state='on'/>")?;
@@ -17,7 +27,13 @@ pub fn render(view: &VmView<'_>) -> Result<String, XmlError> {
         writeln!(xml, "      <spinlocks state='on' retries='8191'/>")?;
         writeln!(xml, "      <vpindex state='on'/>")?;
         writeln!(xml, "      <synic state='on'/>")?;
-        writeln!(xml, "      <stimer state='on' direct='on'/>")?;
+        // libvirt's domain schema models `direct` as a child element
+        // of `<stimer>`, not an attribute. Earlier revisions emitted
+        // `<stimer state='on' direct='on'/>`, which `virt-xml-validate`
+        // rejected with "Extra element features in interleave".
+        writeln!(xml, "      <stimer state='on'>")?;
+        writeln!(xml, "        <direct state='on'/>")?;
+        writeln!(xml, "      </stimer>")?;
         writeln!(xml, "      <reset state='on'/>")?;
         writeln!(xml, "      <frequencies state='on'/>")?;
         writeln!(xml, "      <reenlightenment state='on'/>")?;
@@ -62,6 +78,13 @@ mod tests {
         assert!(xml.contains("<hyperv mode='custom'>"));
         assert!(xml.contains("<vapic state='on'/>"));
         assert!(xml.contains("<spinlocks state='on' retries='8191'/>"));
+        // `<stimer>` ships with `<direct>` as a child element, not
+        // a `direct='on'` attribute. The latter is rejected by
+        // libvirt's Relax-NG schema; this assertion locks in the
+        // correct shape.
+        assert!(xml.contains("<stimer state='on'>"));
+        assert!(xml.contains("<direct state='on'/>"));
+        assert!(!xml.contains("<stimer state='on' direct='on'/>"));
         assert!(xml.contains("<ipi state='on'/>"));
         assert!(xml.contains("<ioapic driver='kvm'/>"));
         assert!(!xml.contains("<kvm>"));
@@ -95,5 +118,42 @@ mod tests {
         let xml = render(&view).expect("render");
         assert!(!xml.contains("<hyperv"));
         assert!(!xml.contains("<ioapic driver='kvm'/>"));
+    }
+
+    /// OVMF Secure Boot needs SMM enabled in `<features>` so the
+    /// firmware variable store is tamper-resistant. The element is
+    /// `<smm state='on'/>` — older revisions of this code emitted
+    /// `<smmbios mode='host'/>` from the firmware renderer, which is
+    /// not a real libvirt schema element and gets rejected by
+    /// `virt-xml-validate`. Pinning the schema-correct shape here
+    /// ensures the default Windows-11 plan (which sets
+    /// `enable_secure_boot=true`) produces XML libvirt accepts.
+    #[test]
+    fn features_renderer_emits_smm_when_secure_boot_enabled() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let mut view = vm_view(&profile, &config).expect("view");
+        view.enable_secure_boot = true;
+
+        let xml = render(&view).expect("render");
+        assert!(xml.contains("<smm state='on'/>"));
+        // Defense-in-depth: the misnamed legacy element must never
+        // come back.
+        assert!(!xml.contains("smmbios"));
+    }
+
+    /// Without Secure Boot, the `<smm>` block must be absent. This
+    /// pins the off-state so a future change cannot silently force
+    /// SMM on for every guest (some workloads explicitly disable it
+    /// to free a vCPU mode).
+    #[test]
+    fn features_renderer_omits_smm_when_secure_boot_disabled() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let mut view = vm_view(&profile, &config).expect("view");
+        view.enable_secure_boot = false;
+
+        let xml = render(&view).expect("render");
+        assert!(!xml.contains("<smm"));
     }
 }

@@ -87,6 +87,49 @@ mod tests {
         ));
     }
 
+    /// Real-host smoke for the schema-correct Secure Boot XML.
+    /// Renders the default Windows-11 plan (which has
+    /// `enable_secure_boot=true` because of `GuestOs::Windows11`)
+    /// and feeds it to `virt-xml-validate`. Catches any future
+    /// regression that re-introduces the `<smmbios>` typo or moves
+    /// `<smm>` back to the wrong block.
+    ///
+    /// Gated by `VIRTU_RUN_VIRT_XML_VALIDATE_SMOKE=1` so the normal
+    /// `cargo test` run stays hermetic. Skips on hosts where
+    /// `virt-xml-validate` is not on PATH.
+    #[test]
+    fn generate_vm_xml_passes_virt_xml_validate_for_default_secure_boot_plan() {
+        if std::env::var("VIRTU_RUN_VIRT_XML_VALIDATE_SMOKE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        if which::which("virt-xml-validate").is_err() {
+            return;
+        }
+
+        let profile = dummy_profile();
+        let config = dummy_config();
+        let xml = generate_vm_xml(&profile, &config).expect("XML must render");
+
+        // Regression pins on the bytes themselves: the schema-correct
+        // SMM lives in <features>, the legacy typo must not appear.
+        assert!(
+            xml.contains("<smm state='on'/>"),
+            "default Windows-11 plan must enable SMM via <features>"
+        );
+        assert!(
+            !xml.contains("smmbios"),
+            "smmbios is not a valid libvirt element"
+        );
+
+        // And the ground-truth: libvirt's schema accepts it.
+        crate::config::writers::commands::validate_xml(&xml)
+            .expect("virt-xml-validate must accept the default Windows-11 XML");
+    }
+
     fn dummy_config() -> PassthroughConfig {
         PassthroughConfig {
             vm_name: "virtu-windows".to_string(),

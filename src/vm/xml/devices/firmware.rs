@@ -30,9 +30,13 @@ pub fn render(
     )?;
     writeln!(xml, "    <nvram>{ovmf_vars}</nvram>")?;
 
-    if view.enable_secure_boot {
-        writeln!(xml, "    <smmbios mode='host'/>")?;
-    }
+    // SMM is required by OVMF Secure Boot and is emitted by the
+    // features renderer (`<features><smm state='on'/></features>`).
+    // Older revisions of this file emitted a non-existent `<smmbios>`
+    // element here when Secure Boot was enabled; that produced XML
+    // `virt-xml-validate` rejected. The features renderer is the
+    // schema-correct location, so this block is intentionally empty.
+    let _ = view.enable_secure_boot;
 
     writeln!(xml, "    <bootmenu enable='yes' timeout='3000'/>")?;
 
@@ -94,5 +98,26 @@ mod tests {
             .find("<boot dev='hd'/>")
             .expect("hd boot entry must be present");
         assert!(cdrom < hd, "cdrom must come before hd so the install boots");
+    }
+
+    /// Secure Boot is expressed via SMM in the `<features>` block.
+    /// The firmware renderer must not emit `<smmbios>` (a legacy
+    /// typo for an element that does not exist in libvirt's schema)
+    /// or `<smm>` (which belongs in `<features>`, not `<os>`).
+    /// A regression here would re-introduce XML that
+    /// `virt-xml-validate` rejects.
+    #[test]
+    fn firmware_renderer_does_not_emit_smm_or_smmbios_for_secure_boot() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let mut view = vm_view(&profile, &config).expect("view");
+        view.enable_secure_boot = true;
+        let kb = KnowledgeBase::bundled();
+
+        let xml = render(&view, &profile, &kb).expect("render");
+        assert!(!xml.contains("smmbios"));
+        // `<smm>` belongs in features.rs, never in this file's <os> block.
+        assert!(!xml.contains("<smm "));
+        assert!(!xml.contains("<smm/>"));
     }
 }

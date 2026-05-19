@@ -5,12 +5,36 @@ use crate::vm::profile::VmView;
 use crate::vm::xml::XmlError;
 use std::fmt::Write as FmtWrite;
 
-pub fn render(view: &VmView<'_>, system: &SystemProfile) -> Result<String, XmlError> {
+/// Render the resource-allocation chunk that libvirt's domain schema
+/// expects **before** `<os>`: `<vcpu>`, `<iothreads>`, and the
+/// `<cputune>` pinning block. Splitting this from the post-`<os>`
+/// CPU/clock chunk is required because libvirt's Relax-NG groups
+/// these elements with `<memory>`/`<currentMemory>` in a pre-OS
+/// interleave; emitting them after `<features>` makes
+/// `virt-xml-validate` reject the document with "Extra element
+/// features in interleave".
+pub fn render_resources(view: &VmView<'_>, system: &SystemProfile) -> Result<String, XmlError> {
+    let mut xml = String::new();
+
+    writeln!(xml, "  <vcpu placement='static'>{}</vcpu>", view.vcpu_count)?;
+
+    if view.use_cpu_pinning && view.use_iothreads {
+        writeln!(xml, "  <iothreads>1</iothreads>")?;
+    }
+
+    write_cpu_tune(&mut xml, view, system)?;
+
+    Ok(xml)
+}
+
+/// Render the post-`<os>` chunk: `<cpu>` topology and `<clock>`.
+/// libvirt's schema places these after `<features>`, so the builder
+/// invokes this helper after `features::render`.
+pub fn render_processor(view: &VmView<'_>, system: &SystemProfile) -> Result<String, XmlError> {
     let mut xml = String::new();
 
     write_cpu(&mut xml, view, system)?;
     write_clock(&mut xml, view)?;
-    write_cpu_tune(&mut xml, view, system)?;
 
     Ok(xml)
 }
@@ -42,7 +66,6 @@ fn write_cpu(xml: &mut String, view: &VmView<'_>, system: &SystemProfile) -> Res
     }
 
     writeln!(xml, "  </cpu>")?;
-    writeln!(xml, "  <vcpu placement='static'>{vcpu_count}</vcpu>")?;
 
     Ok(())
 }
@@ -100,16 +123,12 @@ fn write_cpu_tune(
 
     writeln!(xml, "  </cputune>")?;
 
-    if view.use_iothreads {
-        writeln!(xml, "  <iothreads>1</iothreads>")?;
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{render_processor, render_resources};
     use crate::vm::profile::vm_view;
     use crate::vm::xml::devices::fixtures::{
         amd_host_with_amd_passthrough, nvidia_passthrough_profile,
@@ -120,13 +139,21 @@ mod tests {
     /// 1 socket / 2 cores / 2 threads (4 vCPUs split across HT pairs),
     /// `topoext` (AMD requires it), the Hyper-V clock timer, and a
     /// utc clock offset because the guest is Windows-11.
+    ///
+    /// The renderer is split in two: `render_resources` produces the
+    /// pre-`<os>` chunk (`<vcpu>`, `<iothreads>`, `<cputune>`),
+    /// `render_processor` produces the post-`<os>` chunk (`<cpu>`,
+    /// `<clock>`). We assert on the union here because that is what
+    /// the orchestrator emits into the final document.
     #[test]
     fn cpu_renderer_amd_default_emits_pinning_and_topoext_and_hyperv_clock() {
         let profile = amd_host_with_amd_passthrough();
         let config = windows_dual_gpu_config_amd_passthrough();
         let view = vm_view(&profile, &config).expect("view");
 
-        let xml = render(&view, &profile).expect("render");
+        let resources = render_resources(&view, &profile).expect("render resources");
+        let processor = render_processor(&view, &profile).expect("render processor");
+        let xml = format!("{resources}{processor}");
 
         assert!(xml.contains("<cpu mode='host-passthrough' check='none' migratable='off'>"));
         assert!(xml.contains("<topology sockets='1' dies='1' cores='2' threads='2'/>"));
@@ -157,13 +184,14 @@ mod tests {
         let config = windows_dual_gpu_config_nvidia_passthrough();
         let view = vm_view(&profile, &config).expect("view");
 
-        let xml = render(&view, &profile).expect("render");
+        let xml = render_processor(&view, &profile).expect("render processor");
         assert!(xml.contains("<vendor_id state='on' value='AuthenticAMD'/>"));
     }
 
     /// `use_cpu_pinning = false` removes the entire `<cputune>` and
-    /// `<iothreads>` blocks. We pin both so a future change cannot
-    /// silently land vCPU pinning when the user opted out.
+    /// `<iothreads>` blocks from the resources chunk. We pin both so
+    /// a future change cannot silently land vCPU pinning when the
+    /// user opted out.
     #[test]
     fn cpu_renderer_omits_cputune_when_pinning_disabled() {
         let profile = amd_host_with_amd_passthrough();
@@ -171,9 +199,41 @@ mod tests {
         let mut view = vm_view(&profile, &config).expect("view");
         view.use_cpu_pinning = false;
 
-        let xml = render(&view, &profile).expect("render");
+        let xml = render_resources(&view, &profile).expect("render resources");
         assert!(!xml.contains("<cputune>"));
         assert!(!xml.contains("<iothreads>"));
         assert!(!xml.contains("<vcpupin"));
+        // <vcpu> still ships even without pinning; pinning is the
+        // optional layer.
+        assert!(xml.contains("<vcpu placement='static'>"));
+    }
+
+    /// `render_resources` must NOT emit `<cpu>` or `<clock>`: those
+    /// belong post-`<os>`. Pinning this prevents a future regression
+    /// that re-merges the two halves and breaks the schema interleave.
+    #[test]
+    fn render_resources_does_not_emit_post_os_elements() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render_resources(&view, &profile).expect("render resources");
+        assert!(!xml.contains("<cpu mode="));
+        assert!(!xml.contains("<clock"));
+    }
+
+    /// `render_processor` must NOT emit `<vcpu>`, `<iothreads>`, or
+    /// `<cputune>`: those belong pre-`<os>`. Pinning prevents the
+    /// dual emission that would corrupt the document.
+    #[test]
+    fn render_processor_does_not_emit_pre_os_elements() {
+        let profile = amd_host_with_amd_passthrough();
+        let config = windows_dual_gpu_config_amd_passthrough();
+        let view = vm_view(&profile, &config).expect("view");
+
+        let xml = render_processor(&view, &profile).expect("render processor");
+        assert!(!xml.contains("<vcpu "));
+        assert!(!xml.contains("<iothreads>"));
+        assert!(!xml.contains("<cputune>"));
     }
 }
