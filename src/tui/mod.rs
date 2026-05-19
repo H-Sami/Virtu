@@ -32,18 +32,22 @@ use crate::detect::{self, SystemProfile};
 use crate::engine::{build_compatibility_report, CompatibilityReport};
 use crate::tui::screens::choices::{self, ChoiceAction, ChoiceState};
 use crate::tui::screens::detection::{self, DetectionView};
+use crate::tui::screens::preview::{self, PreviewAction, PreviewState};
 use crate::vm::PassthroughConfig;
 
 /// Top-level wizard state machine. Each screen is one variant. Slice
-/// 10.2 ships only `Detection`; slice 10.3 adds `Choices`, slice 10.4
-/// adds `PlanPreview`, and a closing `Confirmed` will signal "user
-/// approved, hand off to the planner".
+/// 10.2 added `Detection`, 10.3 added `Choices`, and 10.4 closes the
+/// loop with `Preview`. After confirmation the loop exits and the CLI
+/// prints the chosen plan to stdout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Screen {
     /// Read-only detection summary with the compatibility report.
     Detection,
     /// Interactive choice flow: GPU mode, monitor plan, RAM, vCPU.
     Choices,
+    /// Plan preview + confirmation. The user reviews every step the
+    /// planner emitted and either confirms or backs out.
+    Preview,
     /// User pressed quit; the event loop exits at the top of the next
     /// iteration. This variant exists so the loop can distinguish
     /// "user wants out" from "render and wait again".
@@ -51,14 +55,17 @@ enum Screen {
 }
 
 /// Aggregate UI state. Built once when the wizard starts and read by
-/// every screen on every frame. Future slices add fields here for the
-/// final plan-preview and confirmation step.
+/// every screen on every frame.
 struct App {
     screen: Screen,
     profile: SystemProfile,
     report: CompatibilityReport,
     config: PassthroughConfig,
     choices: ChoiceState,
+    /// Lazily built when the user first advances to the preview
+    /// screen. Rebuilt every time they move from Choices → Preview so
+    /// late edits propagate.
+    preview: Option<PreviewState>,
 }
 
 /// Entry point invoked from `virtu wizard` (and the default `virtu`
@@ -84,11 +91,58 @@ pub async fn run_wizard() -> Result<()> {
     });
 
     let mut terminal = setup_terminal().context("entering the alternate-screen TUI")?;
-    let result = run_event_loop(&mut terminal, App::new(profile, report, config));
+    let mut app = App::new(profile, report, config);
+    let result = run_event_loop(&mut terminal, &mut app);
     // Always restore the terminal, even if the loop errored. The user
     // should never have to type `reset` because Virtu crashed.
     let restore = restore_terminal(&mut terminal);
-    result.and(restore)
+    result.and(restore)?;
+
+    if app.was_confirmed() {
+        print_confirmed_plan(&app);
+    } else {
+        println!("Wizard exited without confirming a plan.");
+    }
+    Ok(())
+}
+
+/// Print the plan the user just confirmed in plain text after the
+/// alternate-screen has been torn down. The CLI does not (yet) drop
+/// directly into `virtu apply`; the user reviews the printed plan and
+/// runs the apply command themselves. Wiring auto-apply lives in a
+/// follow-up slice so the wizard can stay non-mutating until then.
+fn print_confirmed_plan(app: &App) {
+    use crate::engine::plan;
+    println!("=== VIRTU WIZARD: CONFIRMED PLAN ===");
+    println!(
+        "VM name:       {}\nGuest OS:      {:?}\nGPU mode:      {}\nMonitor plan:  {:?}",
+        app.config.vm_name, app.config.guest_os, app.config.gpu_mode, app.config.monitor_plan,
+    );
+    println!(
+        "VM resources:  {} MiB RAM, {} vCPUs, disk {:?}",
+        app.config.resources.ram_mb, app.config.resources.vcpu_count, app.config.resources.disk
+    );
+    println!();
+    match plan(&app.profile, &app.report, &app.config) {
+        Ok(plan) => {
+            println!("{} step(s):", plan.steps.len());
+            for (idx, step) in plan.steps.iter().enumerate() {
+                println!("  {:>2}. [{}] {}", idx + 1, step.risk, step.title);
+            }
+            println!(
+                "\nMax risk: {}    Reboot required: {}    Confirmation required: {}",
+                plan.summary.max_risk,
+                plan.summary.requires_reboot,
+                plan.summary.requires_confirmation,
+            );
+            println!(
+                "\nReview, then run:\n  virtu apply --phase a --confirm   # to start the host edits\n  virtu rollback --to <id>          # to undo, after a snapshot exists"
+            );
+        }
+        Err(err) => {
+            println!("Plan generation failed after wizard confirmation: {err}");
+        }
+    }
 }
 
 /// Stand-in `PassthroughConfig` used when the host has no GPUs at all.
@@ -136,11 +190,25 @@ impl App {
             report,
             config,
             choices,
+            preview: None,
         }
+    }
+
+    fn enter_preview(&mut self) {
+        self.preview = Some(PreviewState::new(&self.profile, &self.report, &self.config));
+        self.screen = Screen::Preview;
+    }
+
+    /// True when the wizard finished successfully with a confirmed
+    /// plan. The CLI checks this after the event loop returns and
+    /// prints the plan to stdout once the alternate-screen has been
+    /// torn down.
+    fn was_confirmed(&self) -> bool {
+        matches!(&self.preview, Some(state) if state.confirmed)
     }
 }
 
-fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: App) -> Result<()> {
+fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     // The detection view is rebuilt on Refresh events (resize) so the
     // pre-rendered text stays in sync with `app.profile` / `app.report`.
     let mut detection_view = DetectionView::new(&app.profile, &app.report);
@@ -163,36 +231,79 @@ fn run_event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, mut app: Ap
                     })
                     .context("drawing the choices screen")?;
             }
+            Screen::Preview => {
+                let state = app
+                    .preview
+                    .as_ref()
+                    .expect("preview state must be built before entering the preview screen");
+                terminal
+                    .draw(|frame| {
+                        let area = frame.size();
+                        preview::render(frame, area, state);
+                    })
+                    .context("drawing the preview screen")?;
+            }
             Screen::Exiting => break,
         }
 
         match next_event()? {
-            Some(WizardEvent::Quit) => app.screen = Screen::Exiting,
+            Some(WizardEvent::Quit) => match app.screen {
+                // From the preview screen, `q`/`Esc` go back to
+                // choices so the user can amend without losing the
+                // wizard. From any other screen quit closes the
+                // whole wizard.
+                Screen::Preview => {
+                    app.screen = Screen::Choices;
+                    app.preview = None;
+                }
+                _ => app.screen = Screen::Exiting,
+            },
             Some(WizardEvent::Continue) => match app.screen {
                 Screen::Detection => app.screen = Screen::Choices,
-                // The plan-preview screen lands in slice 10.4. For now,
-                // pressing Enter on the choice screen flushes the
-                // current choices into `app.config` and noops; the
-                // user can still see the live preview by leaving the
-                // wizard via `q` and running `virtu plan`.
                 Screen::Choices => {
+                    // Commit any pending edits and build a fresh
+                    // preview from the current config.
                     app.choices.apply_to(&app.profile, &mut app.config);
+                    app.enter_preview();
                 }
+                Screen::Preview => {} // Confirm goes through PreviewMove
                 Screen::Exiting => {}
             },
             Some(WizardEvent::ChoiceMove(action)) if app.screen == Screen::Choices => {
                 app.choices.apply(action);
                 // Mirror the user's edits into the working config
-                // immediately so the preview screen (slice 10.4)
-                // always sees current data without an extra commit
-                // step. Costs a few clones per keypress; the
-                // config struct is small.
+                // immediately so the preview screen always sees
+                // current data without an extra commit step. Costs a
+                // few clones per keypress; the config struct is
+                // small.
                 app.choices.apply_to(&app.profile, &mut app.config);
             }
+            Some(WizardEvent::ChoiceMove(action)) if app.screen == Screen::Preview => {
+                // On the preview screen, j/k/arrow translate to
+                // scroll. h/l are ignored (no horizontal layout).
+                let preview_action = match action {
+                    ChoiceAction::PrevField => Some(PreviewAction::ScrollUp),
+                    ChoiceAction::NextField => Some(PreviewAction::ScrollDown),
+                    _ => None,
+                };
+                if let (Some(preview_action), Some(state)) = (preview_action, app.preview.as_mut())
+                {
+                    state.apply(preview_action);
+                }
+            }
             Some(WizardEvent::ChoiceMove(_)) => {
-                // ChoiceMove on a non-Choices screen: ignore. Slice
-                // 10.4 may bind these to the plan-preview scroll
-                // controls; today they're a no-op.
+                // ChoiceMove on the detection screen: ignore.
+            }
+            Some(WizardEvent::PreviewMove(action)) if app.screen == Screen::Preview => {
+                if let Some(state) = app.preview.as_mut() {
+                    state.apply(action);
+                    if state.confirmed {
+                        app.screen = Screen::Exiting;
+                    }
+                }
+            }
+            Some(WizardEvent::PreviewMove(_)) => {
+                // PreviewMove on a non-Preview screen: ignore.
             }
             Some(WizardEvent::Refresh) => {
                 detection_view = DetectionView::new(&app.profile, &app.report);
@@ -214,6 +325,9 @@ enum WizardEvent {
     /// One step inside the choice screen. Slice 10.3 surfaces these as
     /// arrow / hjkl keys; the choice screen interprets them.
     ChoiceMove(ChoiceAction),
+    /// One step inside the preview screen. Slice 10.4 surfaces these
+    /// as scroll / confirm keys.
+    PreviewMove(PreviewAction),
     Refresh,
 }
 
@@ -230,10 +344,19 @@ fn next_event() -> Result<Option<WizardEvent>> {
     }
 }
 
+/// Map a `crossterm` keycode onto a `WizardEvent`. The mapping is
+/// shared across screens; the event loop dispatches based on the
+/// current screen so the same key can be a `ChoiceMove` on one
+/// screen and a `PreviewMove` on another. Confirm (`c`) is a
+/// dedicated keybind so users do not accidentally hit it from the
+/// choice screen.
 fn map_key(code: KeyCode) -> WizardEvent {
     match code {
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => WizardEvent::Quit,
         KeyCode::Enter => WizardEvent::Continue,
+        KeyCode::Char('c') | KeyCode::Char('C') => WizardEvent::PreviewMove(PreviewAction::Confirm),
+        KeyCode::PageUp => WizardEvent::PreviewMove(PreviewAction::PageUp),
+        KeyCode::PageDown => WizardEvent::PreviewMove(PreviewAction::PageDown),
         KeyCode::Up | KeyCode::Char('k') => WizardEvent::ChoiceMove(ChoiceAction::PrevField),
         KeyCode::Down | KeyCode::Char('j') => WizardEvent::ChoiceMove(ChoiceAction::NextField),
         KeyCode::Left | KeyCode::Char('h') => WizardEvent::ChoiceMove(ChoiceAction::DecrementValue),

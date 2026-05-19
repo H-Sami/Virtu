@@ -9,3 +9,4 @@
 
 pub mod choices;
 pub mod detection;
+pub mod preview;
