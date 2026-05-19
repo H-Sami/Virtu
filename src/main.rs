@@ -187,6 +187,50 @@ async fn run_resume() -> Result<()> {
             println!("  - {kind:?}");
         }
     }
+
+    // Defense-in-depth post-check: if Phase B installed single-GPU
+    // hooks, re-read the freshly persisted manifest and run
+    // `verify_hook_install` against the live filesystem. Catches:
+    // - a partial chmod that left a script not executable,
+    // - an OS update that overwrote the dispatcher between Phase B's
+    //   write and resume's exit (rare, but possible if a package post-
+    //   install hook fires inside the same transaction window),
+    // - a manual edit a user might have done in another terminal.
+    //
+    // We do NOT fail the resume on divergences here — Phase B already
+    // succeeded and the manifest is authoritative for rollback. We
+    // surface them as warnings so the user can re-run `virtu apply` or
+    // roll back before starting the VM.
+    if outcome
+        .completed_steps
+        .contains(&engine::StepKind::HookInstall)
+    {
+        let manifest_path = snapshots_root
+            .join(&outcome.snapshot_id)
+            .join(snapshot::MANIFEST_FILENAME);
+        match read_manifest_from_disk(&manifest_path) {
+            Ok(manifest) => {
+                let divergences =
+                    engine::verify_hook_install(&manifest, &filesystem, &pending.config.vm_name);
+                if !divergences.is_empty() {
+                    println!("\n[WARN] Single-GPU hook scripts diverge from the Phase-B manifest:");
+                    for divergence in &divergences {
+                        println!("  - {}", divergence.human_summary());
+                    }
+                    println!(
+                        "       Re-run `virtu apply` to regenerate, or `virtu rollback --to {}` to undo.",
+                        outcome.snapshot_id
+                    );
+                }
+            }
+            Err(err) => {
+                println!(
+                    "\n[WARN] Could not re-read the snapshot manifest at {} to verify hook scripts: {err}.\n       Phase B succeeded; this is a verification-only failure.",
+                    manifest_path.display()
+                );
+            }
+        }
+    }
     if outcome.pending_cleared {
         println!("\nPending-plan record cleared. You can run `virtu apply` again later.");
     } else {
@@ -197,6 +241,16 @@ async fn run_resume() -> Result<()> {
     }
     println!("\nSnapshot id (kept for rollback): {}", outcome.snapshot_id);
     Ok(())
+}
+
+/// Read a SnapshotManifest from disk, propagating any I/O or parse
+/// failures with context for the caller. Used by `run_resume` to
+/// re-read the manifest Phase B just persisted so the post-Phase-B
+/// hook verifier sees current bytes.
+fn read_manifest_from_disk(path: &std::path::Path) -> Result<snapshot::SnapshotManifest> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading manifest at {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("parsing manifest at {}", path.display()))
 }
 
 /// Print a one-line warning if a pending Phase-A record exists. Called
