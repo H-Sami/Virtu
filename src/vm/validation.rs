@@ -63,6 +63,7 @@ pub enum ValidationIssueId {
     LookingGlassResolutionInvalid,
     LookingGlassAutoBuildNotImplemented,
     HookHandoffRequiresSingleGpu,
+    HookHandoffRequiresKnownDisplayManager,
     IsoMissing,
     DiskPathExistsForCreate,
     DiskPathMissingForExisting,
@@ -106,6 +107,9 @@ impl std::fmt::Display for ValidationIssueId {
                 "looking-glass-auto-build-not-implemented"
             }
             ValidationIssueId::HookHandoffRequiresSingleGpu => "hook-handoff-requires-single-gpu",
+            ValidationIssueId::HookHandoffRequiresKnownDisplayManager => {
+                "hook-handoff-requires-known-display-manager"
+            }
             ValidationIssueId::IsoMissing => "iso-missing",
             ValidationIssueId::DiskPathExistsForCreate => "disk-path-exists-for-create",
             ValidationIssueId::DiskPathMissingForExisting => "disk-path-missing-for-existing",
@@ -425,6 +429,34 @@ fn check_monitors(
                     issues.push(ValidationIssue::error(
                         ValidationIssueId::HookHandoffRequiresSingleGpu,
                         "Hook-based monitor hand-off only applies to single-GPU passthrough.",
+                    ));
+                }
+                // Defense-in-depth at plan time. The hook generator
+                // (`config::writers::hooks::release_script`) already
+                // refuses Unknown / None display managers, but its
+                // refusal surfaces inside Phase B — *after* Phase A
+                // has mutated the bootloader, initramfs, and VFIO
+                // modprobe. The user is then left with VFIO bound
+                // but no working hooks; the only recovery is
+                // `virtu rollback`. Catching the unsupported DM at
+                // plan time means Phase A never runs against an
+                // impossible plan.
+                if matches!(
+                    profile.display_manager,
+                    crate::detect::display_manager::DisplayManager::Unknown
+                        | crate::detect::display_manager::DisplayManager::None
+                ) {
+                    issues.push(ValidationIssue::error(
+                        ValidationIssueId::HookHandoffRequiresKnownDisplayManager,
+                        format!(
+                            "Single-GPU hook hand-off requires a recognized display manager \
+                             so the begin/end scripts can stop and restart it cleanly. \
+                             Detected display manager: `{}`. Switch the monitor plan to \
+                             `SwitchInputs`, install one of the supported display managers \
+                             (GDM / SDDM / LightDM / greetd / ly / lxdm), or run on a host \
+                             where a managed DM is active.",
+                            profile.display_manager
+                        ),
                     ));
                 }
             }

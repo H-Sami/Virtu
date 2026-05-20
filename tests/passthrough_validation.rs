@@ -338,6 +338,106 @@ async fn hook_handoff_requires_single_gpu_mode() {
 }
 
 #[tokio::test]
+async fn hook_handoff_with_unknown_display_manager_is_rejected_at_plan_time() {
+    // Regression for the post-slice-10.8 audit (Finding A): the
+    // hook generator (`config::writers::hooks::release_script`)
+    // refuses Unknown / None display managers, but the refusal
+    // surfaces inside Phase B — *after* Phase A has already
+    // mutated the bootloader, initramfs, and VFIO modprobe. The
+    // user is then left with VFIO bound but no working hooks.
+    // Validation must catch this combination at plan time so
+    // Phase A never runs against an impossible plan.
+    let mut profile = fixture_profile().await;
+    profile.display_manager = virtu::detect::display_manager::DisplayManager::Unknown;
+
+    let report = build_compatibility_report(&profile);
+    let mut config = PassthroughConfig::recommended_defaults(&profile).unwrap();
+    // Force the single-GPU + hook-handoff combination the rule
+    // gates on. The fixture profile has two GPUs, so we ignore the
+    // host iGPU and switch to single-GPU mode.
+    for role in &mut config.gpu_roles {
+        if role.role == GpuRole::Host {
+            role.role = GpuRole::Ignored;
+        }
+    }
+    config.gpu_mode = GpuPassthroughMode::SingleGpu;
+    config.monitor_plan = MonitorPlan::OneMonitor {
+        strategy: SingleMonitorStrategy::HookHandoff,
+    };
+
+    let result = validate(&profile, &report, &config);
+
+    assert!(
+        result.has_issue(ValidationIssueId::HookHandoffRequiresKnownDisplayManager),
+        "expected validation error for Unknown DM, got issues: {:?}",
+        result.issues
+    );
+    assert!(
+        result.has_errors(),
+        "the rule must be error severity, not just a warning"
+    );
+}
+
+#[tokio::test]
+async fn hook_handoff_with_no_display_manager_is_rejected_at_plan_time() {
+    // Companion to the Unknown case above. A TTY-only host with no
+    // managed display manager service hits the same defense-in-
+    // depth gap: Phase A would mutate the host, then Phase B would
+    // refuse at HookInstall.
+    let mut profile = fixture_profile().await;
+    profile.display_manager = virtu::detect::display_manager::DisplayManager::None;
+
+    let report = build_compatibility_report(&profile);
+    let mut config = PassthroughConfig::recommended_defaults(&profile).unwrap();
+    for role in &mut config.gpu_roles {
+        if role.role == GpuRole::Host {
+            role.role = GpuRole::Ignored;
+        }
+    }
+    config.gpu_mode = GpuPassthroughMode::SingleGpu;
+    config.monitor_plan = MonitorPlan::OneMonitor {
+        strategy: SingleMonitorStrategy::HookHandoff,
+    };
+
+    let result = validate(&profile, &report, &config);
+
+    assert!(result.has_issue(ValidationIssueId::HookHandoffRequiresKnownDisplayManager));
+    assert!(result.has_errors());
+}
+
+#[tokio::test]
+async fn hook_handoff_does_not_fire_when_strategy_is_switch_inputs() {
+    // Defense-in-depth: the new rule must only gate on the
+    // HookHandoff strategy. SwitchInputs and LookingGlassOnly
+    // single-monitor plans don't install hooks, so they don't
+    // care what the display manager is. The fixture profile has
+    // SDDM by default, so we use Unknown here to make the absence
+    // of the new error meaningful.
+    let mut profile = fixture_profile().await;
+    profile.display_manager = virtu::detect::display_manager::DisplayManager::Unknown;
+
+    let report = build_compatibility_report(&profile);
+    let mut config = PassthroughConfig::recommended_defaults(&profile).unwrap();
+    for role in &mut config.gpu_roles {
+        if role.role == GpuRole::Host {
+            role.role = GpuRole::Ignored;
+        }
+    }
+    config.gpu_mode = GpuPassthroughMode::SingleGpu;
+    config.monitor_plan = MonitorPlan::OneMonitor {
+        strategy: SingleMonitorStrategy::SwitchInputs,
+    };
+
+    let result = validate(&profile, &report, &config);
+
+    assert!(
+        !result.has_issue(ValidationIssueId::HookHandoffRequiresKnownDisplayManager),
+        "rule must only fire when the strategy is HookHandoff; got: {:?}",
+        result.issues
+    );
+}
+
+#[tokio::test]
 async fn looking_glass_requires_a_passthrough_gpu() {
     let profile = fixture_profile().await;
     let report = build_compatibility_report(&profile);
